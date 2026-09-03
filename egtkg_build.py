@@ -15,7 +15,7 @@ Per the paper:
      on an LLM-compressed summary the paper warns degrades answers.
 
 Training rows (ChatML messages) are generated for a local SLM fine-tuner
-(same pipeline as the soup-daily-finetune pattern, but now evidence-grounded
+(same pipeline as the proven soup-daily-finetune pattern, but now evidence-grounded
 medical QA instead of finance alpaca).
 """
 import argparse

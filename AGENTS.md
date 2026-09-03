@@ -37,7 +37,8 @@ machine and no API keys needed to run.
 1. **Never commit credentials.** Everything is GitHub secrets / env vars:
    `COLAB_CLIENT_ID`, `COLAB_CLIENT_SECRET`, `COLAB_REFRESH_TOKEN`,
    `GDRIVE_ADC` (authorized_user JSON), `DRIVE_ADAPTER_IN`, `DRIVE_RESULTS`.
-   Grep for `ya29.`, `1//0`, client_secret literals, `gcloud client-id pattern`,
+   Grep for `ya29.`, `1//0`, client_secret literals, gcloud client-id
+   patterns (`NNNNNNNNNN-*.apps.googleusercontent.com`),
    email addresses, `/home/`, `.config/colab-cli` before any commit.
    `.gitignore` excludes `*.json` and runner output.
 2. **Colab free tier is ephemeral** (~2 h kernel recycle / ~12 h cap, RAM
@@ -52,7 +53,7 @@ machine and no API keys needed to run.
    junk; rows are evidence-grounded, so a noisy head occasionally appears but
    the assistant text always quotes real evidence verbatim.
 
-## Drive layout (account the Run account)
+## Drive layout (the Run account's Google Drive)
 - `gi-egtkg/adapter_in/` — latest adapter (continuity pointer; shared
   anyone-with-link so `deploy_chat.py` can `gdown --folder` it).
 - `gi-egtkg/results/<date>/adapter_model.safetensors` + `metrics.json` +
