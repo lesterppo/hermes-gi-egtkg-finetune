@@ -13,6 +13,7 @@ Usage:
     python pubmed_ingest.py --days 2 --store knowledge_store.jsonl --out new_articles.jsonl
 """
 import argparse
+import datetime
 import json
 import pathlib
 import re
@@ -80,7 +81,11 @@ def esearch_pmids(days):
         "db": "pubmed",
         "term": f"{QUERY} AND ({dateq})",
         "retmode": "json",
-        "retmax": "400",
+        # newest-2000 slice of the window (date-sorted). OA/PMC articles
+        # typically carry June-July epub dates while the newest 400 are
+        # in-press Sept items — a 400 cap left the OA cohort permanently
+        # outside the fetch head (0 OA hits in the smoke run).
+        "retmax": "2000",
         "sort": "date",
     }
     url = EUTILS + "esearch.fcgi?" + urllib.parse.urlencode(params)
@@ -204,8 +209,32 @@ def main():
     print(f"[ingest] {len(new)} new (not in store of {len(store)})", flush=True)
 
     oa_done = 0
-    oa_probe = getattr(args, "oa_probe", 24)
-    for a in new[:oa_probe]:  # bound the EPMC probe — scanning ALL new is too slow
+    # OA-targeted probe: instead of blind-sampling the newest N (mostly
+    # non-OA, 0/40 hit in the smoke run), query Europe PMC once for OA articles
+    # with full text in the window. NOTE: EPMC needs ITS OWN query syntax
+    # (MESH:"...", FIRST_PDATE range, HAS_FT) — PubMed [Journal]/[tiab] tags
+    # return 0 there. PMC full-text indexing lags PubMed by ~2 months, so the
+    # lookback is 90d regardless of the PubMed ingest window.
+    oa_pmids = set()
+    try:
+        start = (datetime.date.today() - datetime.timedelta(days=90)).isoformat()
+        end = datetime.date.today().isoformat()
+        oq = ('(MESH:"Digestive System Diseases" OR MESH:"Liver Diseases") AND '
+              f'(OPEN_ACCESS:y OR IN_EPMC:y) AND HAS_FT:y AND SRC:MED AND '
+              f'FIRST_PDATE:[{start} TO {end}]')
+        ourl = EPMC + "search?" + urllib.parse.urlencode(
+            {"query": oq, "format": "json", "pageSize": str(args.max_oa * 3)})
+        odata = json.loads(http_get(ourl, timeout=60))
+        for h in odata.get("resultList", {}).get("result", []):
+            if h.get("pmid"):
+                oa_pmids.add(str(h["pmid"]))
+        print(f"[ingest] EPMC OA-targeted (90d): {len(oa_pmids)} OA full-text articles", flush=True)
+    except Exception as e:
+        print(f"[ingest] OA targeted query failed (fallback to blind probe): {e}", flush=True)
+    # order: OA-first, then the rest (still bounded by oa_probe)
+    ordered = ([a for a in new if a["pmid"] in oa_pmids]
+               + [a for a in new if a["pmid"] not in oa_pmids])
+    for a in ordered[:max(args.max_oa * 3, args.oa_probe)]:
         if oa_done >= args.max_oa:
             break
         a["oa_fulltext"] = epmc_oa_fulltext(a)
@@ -214,7 +243,54 @@ def main():
             if oa_done % 5 == 0:
                 print(f"[ingest] OA progress {oa_done}", flush=True)
         time.sleep(0.3)
-    print(f"[ingest] Europe PMC OA full texts: {oa_done}", flush=True)
+    # Merge OA articles that the PubMed date-sorted head MISSED (OA/PMC
+    # cohort carries June-July epub dates; the newest-2000 slice of a
+    # 15430-hit window never reaches them — verified live). Their metadata
+    # comes from the EPMC core hit; full text is fetched below.
+    merged_oa = 0
+    have = {a["pmid"] for a in new}
+    if oa_pmids - have:
+        try:
+            oq2 = ('(MESH:"Digestive System Diseases" OR MESH:"Liver Diseases") AND '
+                   '(OPEN_ACCESS:y OR IN_EPMC:y) AND HAS_FT:y AND SRC:MED AND '
+                   f'FIRST_PDATE:[{(datetime.date.today() - datetime.timedelta(days=90)).isoformat()} TO {datetime.date.today().isoformat()}]')
+            ourl2 = EPMC + "search?" + urllib.parse.urlencode(
+                {"query": oq2, "format": "json", "pageSize": str(args.max_oa * 3),
+                 "resultType": "core"})
+            odata2 = json.loads(http_get(ourl2, timeout=60))
+            for h in odata2.get("resultList", {}).get("result", []):
+                p = str(h.get("pmid") or "")
+                if not p or p in have or p in store:
+                    continue
+                if len(new) - len(have) >= args.max_oa:  # bound the merge
+                    break
+                abst = re.sub(r"\s+", " ", h.get("abstractText") or "").strip()
+                a = {
+                    "pmid": p,
+                    "title": re.sub(r"<[^>]+>", "", h.get("title") or "").strip(),
+                    "abstract": abst,
+                    "journal": (h.get("journalInfo", {}) or {}).get("journal", {}).get("title", ""),
+                    "year": (h.get("pubYear") or ""),
+                    "doi": h.get("doi") or "",
+                    "mesh": [m.get("descriptorName", "") for m in (h.get("meshHeadingList", {}) or {}).get("meshHeading", [])],
+                    "oa_fulltext": "",
+                }
+                if not a["abstract"]:
+                    continue
+                new.append(a)
+                have.add(p)
+                merged_oa += 1
+        except Exception as e:
+            print(f"[ingest] OA merge failed (non-fatal): {e}", flush=True)
+        # now fetch full texts for the merged OA cohort
+        for a in [x for x in new if x["pmid"] in oa_pmids and not x["oa_fulltext"]]:
+            if oa_done >= args.max_oa + merged_oa:
+                break
+            a["oa_fulltext"] = epmc_oa_fulltext(a)
+            if a["oa_fulltext"]:
+                oa_done += 1
+            time.sleep(0.3)
+    print(f"[ingest] Europe PMC OA full texts: {oa_done} (merged {merged_oa} OA-only articles)", flush=True)
 
     for a in new:
         store[a["pmid"]] = a
