@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+run_daily.py — headless daily LoRA fine-tune orchestrator.
+
+Runs inside GitHub Actions (no local machine involved). It:
+  1. Mints a Colab access token from a stored refresh token (server-side OAuth,
+     no browser).
+  2. Writes the colab-cli token.json and the gdrive ADC credentials.
+  3. Creates a free Colab T4 session, uploads daily_finetune.py + the vendored
+     gdrive.py + the ADC JSON, and launches training detached.
+  4. Polls the VM log until the run reports [RESULT] (or times out).
+  5. On success: downloads the new adapter + metrics for the GH artifact tab
+     (Drive continuity is already handled BY THE VM — see below).
+  6. Stops the session.
+
+DRIVE CONTINUITY (why timeouts no longer lose work):
+  daily_finetune.py mounts Drive itself (vendored gdrive.py + the ADC JSON we
+  upload) and pushes a checkpoint to Drive after every --save-steps training
+  steps, plus a final checkpoint + archive + adapter_in update when the run
+  ends (naturally or via its --max-minutes budget). So even if THIS runner
+  times out or the Colab session is recycled mid-training, the newest
+  checkpoint already lives on Drive and the next day's run resumes from it.
+  On runner timeout we additionally pull the newest Drive checkpoint into the
+  adapter_in folder so continuity is preserved even if the VM died before its
+  final push.
+
+Secrets come from environment variables (set by the workflow from GitHub
+secrets). None are ever committed to the repo.
+
+Environment:
+  COLAB_CLIENT_ID         OAuth client id (gcloud "Desktop" OAuth client)
+  COLAB_CLIENT_SECRET     OAuth client secret
+  COLAB_REFRESH_TOKEN     long-lived refresh token (colaboratory + drive.file scope)
+  GDRIVE_ADC              full gcloud ADC JSON (authorized_user) for Drive
+  DRIVE_ADAPTER_IN        Drive folder id for the "latest" adapter (shared, gdown pulls it)
+  DRIVE_RESULTS           Drive folder id for dated result archives + checkpoints/
+  RUN_ROWS                finance-alpaca subset size per day (default 5000)
+  RUN_SAVE_STEPS          checkpoint every N training steps (default 100)
+  RUN_MAX_MINUTES         stop training after N minutes, save final checkpoint (default 240 — covers a full 2000-row epoch)
+"""
+import datetime
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# run_daily.py lives in the same repo as daily_finetune.py — reuse its Drive
+# wrapper + checkpoint discovery instead of duplicating Drive logic.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from daily_finetune import Drive, find_latest_checkpoint, find_latest_archive  # noqa: E402
+
+TOKEN_FILE = pathlib.Path.home() / ".config" / "colab-cli" / "token.json"
+ADC_FILE = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+REPO = pathlib.Path(__file__).resolve().parent
+COLAB_PY = str(REPO / "colab.py")
+GDRIVE_PY = str(REPO / "gdrive.py")
+SESSION = "gi-egtkg-session"
+
+# Colab free-tier sessions recycle after ~2-3h (some last up to 12h); the VM
+# self-stops after RUN_MAX_MINUTES of training (default 100) so a full run fits
+# well inside. The runner's poll budget must OUTLIVE the VM's setup (~12 min) +
+# training, else the runner declares timeout while the VM is still training.
+# Default: max_minutes + 25 (setup slack). Override via TRAIN_TIMEOUT_MIN.
+# In UNLIMITED mode (max_minutes=0) there is no self-stop — the VM trains until
+# Colab recycles it — so the runner observes a fixed window (default 240 min)
+# to confirm checkpoints are flowing, then leaves the session running.
+def train_timeout_s():
+    ov = os.environ.get("TRAIN_TIMEOUT_MIN", "")
+    if ov.strip():
+        return int(float(ov)) * 60
+    mm = int(os.environ.get("RUN_MAX_MINUTES", "100"))
+    if mm <= 0:
+        return 240 * 60
+    return (mm + 25) * 60
+
+
+TRAIN_TIMEOUT_S = train_timeout_s()
+
+# If no new [alive] heartbeat for this long, the VM is dead (session recycled /
+# OOM-killed). Daily_finetune.py emits one every 10 steps (~3-4 min at 20s/step),
+# so 20 min without progress = definitely dead. The runner recovers the latest
+# Drive checkpoint and fails fast instead of polling a corpse for the full
+# TRAIN_TIMEOUT budget.
+HEARTBEAT_STALL_S = 20 * 60
+
+# Colab idle-prunes free VM assignments with NO keep-alive ping. The colab-cli
+# spawns its own keep-alive daemon at `colab new`, but that daemon caches the
+# access token minted at startup (expires ~59 min) and dies with consecutive
+# 4xx — which is EXACTLY the ~60-min VM death observed across runs #12-14 and
+# the 2026-08-22 dispatch. We therefore run OUR OWN keep-alive loop inside the
+# runner's poll window, re-minting a fresh token every ping. This is the
+# deterministic fix for the "VM dies at step ~100 / 60 min" pattern.
+KEEP_ALIVE_INTERVAL_S = 60
+KEEP_ALIVE_URL = "https://colab.research.google.com/tun/m/{endpoint}/keep-alive/"
+KEEP_ALIVE_HEADERS = {
+    "X-Colab-Tunnel": "Google",
+    "Accept": "application/json",
+    "X-Colab-Client-Agent": "colab-cli",
+}
+
+
+def get_session_endpoint(session_name):
+    """Read the assignment endpoint for a session from the colab-cli registry."""
+    store_path = pathlib.Path.home() / ".config" / "colab-cli" / "sessions.json"
+    try:
+        store = json.loads(store_path.read_text())
+        for name, s in store.items():
+            if name == session_name and s.get("endpoint"):
+                return s["endpoint"]
+        # fall back: any entry whose name/endpoint matches the session
+        for name, s in store.items():
+            if s.get("endpoint") and (name == session_name or s.get("name") == session_name):
+                return s["endpoint"]
+    except Exception as e:
+        log(f"could not read session registry for endpoint: {e}")
+    return None
+
+
+def keep_alive_loop(endpoint, stop_event, cadence=KEEP_ALIVE_INTERVAL_S):
+    """Ping the Colab assignment keep-alive endpoint until stop_event is set.
+
+    Each ping mints a FRESH access token (never caches) so the loop outlives
+    the colab-cli daemon's token-expiry death. Read timeouts are expected
+    (TFE records activity before forwarding); only HTTP errors are surfaced.
+    """
+    while not stop_event.is_set():
+        try:
+            tok = mint_access_token(
+                os.environ.get("COLAB_CLIENT_ID", ""),
+                os.environ.get("COLAB_CLIENT_SECRET", ""),
+                os.environ.get("COLAB_REFRESH_TOKEN", ""),
+            )
+            token = tok.get("access_token", "")
+            url = KEEP_ALIVE_URL.format(endpoint=endpoint)
+            req = urllib.request.Request(
+                url + ("&" if "?" in url else "?") + "authuser=0",
+                headers={**KEEP_ALIVE_HEADERS, "Authorization": f"Bearer {token}"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+            log(f"keep-alive ping OK ({endpoint[:24]}...)")
+        except TimeoutError:
+            # Expected: TFE records the activity before forwarding to the VM,
+            # which often doesn't answer on this path. A read timeout means the
+            # keep-alive SUCCEEDED (this matches the official colab-cli client).
+            log(f"keep-alive ping recorded (read timeout = success) ({endpoint[:24]}...)")
+        except urllib.error.HTTPError as e:
+            # Real errors (404 deleted assignment, 4xx/5xx) — surface but keep
+            # trying; a few transient failures must not kill the loop.
+            log(f"keep-alive ping HTTP {e.code} (continuing): {str(e)[:120]}")
+        except Exception as e:
+            log(f"keep-alive ping failed (transient, continuing): {str(e)[:150]}")
+        stop_event.wait(cadence)
+
+
+def _start_keep_alive(session_name):
+    """Start the keep-alive thread for a session; returns the stop event or None."""
+    endpoint = get_session_endpoint(session_name)
+    if not endpoint:
+        log("keep-alive: no endpoint found in session registry — skipping (VM may be pruned at ~60 min)")
+        return None
+    ev = threading.Event()
+    t = threading.Thread(target=keep_alive_loop, args=(endpoint, ev), daemon=True)
+    t.start()
+    log(f"keep-alive loop started for endpoint {endpoint[:24]}... (ping every {KEEP_ALIVE_INTERVAL_S}s)")
+    return ev
+
+
+def _stop_keep_alive(stop_event):
+    if stop_event is not None:
+        stop_event.set()
+        log("keep-alive loop stopped")
+
+
+def log(msg):
+    print(f"[run_daily] {msg}", flush=True)
+
+
+def sh(args, timeout=180, check=False, ok_codes=(0,)):
+    """Run a command, return (returncode, stdout, stderr)."""
+    log("$ " + " ".join(str(a) for a in args))
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return (-1, (e.stdout or "") if isinstance(e.stdout, str) else "", "TIMEOUT")
+    if check and r.returncode not in ok_codes:
+        raise RuntimeError(f"command failed rc={r.returncode}: {args}\n{r.stderr[-2000:]}")
+    return r.returncode, r.stdout, r.stderr
+
+
+def mint_access_token(client_id, client_secret, refresh_token):
+    body = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token", data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def write_token_file(client_id, client_secret, refresh_token, access_token, scopes, expiry_s):
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scopes": scopes,
+        "universe_domain": "googleapis.com",
+        "account": "",
+        "expiry": (datetime.datetime.now(datetime.timezone.utc)
+                   + datetime.timedelta(seconds=expiry_s)).isoformat(),
+    }
+    TOKEN_FILE.write_text(json.dumps(doc, indent=2))
+    log(f"wrote {TOKEN_FILE}")
+
+
+def write_adc_file(adc_json):
+    ADC_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ADC_FILE.write_text(adc_json)
+    ADC_FILE.chmod(0o600)
+    log(f"wrote {ADC_FILE}")
+
+
+# Credentials for in-process token refresh. Set by main() before any colab call.
+_CREDS = {"cid": "", "csec": "", "cref": "", "scopes": []}
+_last_token_refresh = 0.0
+
+
+def set_colab_creds(cid, csec, cref, scopes):
+    _CREDS.update({"cid": cid, "csec": csec, "cref": cref, "scopes": list(scopes)})
+
+
+def refresh_colab_token(force=False):
+    """Re-mint the colab-cli access token (token.json) so `colab logs`/`exec`
+    keep working past the initial token's ~59-min expiry.
+
+    The colab-cli daemon and the vendored colab.py cache the access token
+    minted at startup (expires_in-60). When it expires, `colab logs` starts
+    returning rc=1 even though the VM is ALIVE and training — the runner then
+    falsely declares HEARTBEAT_STALLED and stops a healthy VM (verified live:
+    run 32596123261 pushed step-200 AFTER the runner's 'recover step-100'
+    because the log polls had died at 60 min). Re-mint the token file in
+    process, cheaply, before each poll window.
+    """
+    global _last_token_refresh
+    now = time.time()
+    if not force and now - _last_token_refresh < 300:
+        return True  # at most once per 5 min
+    try:
+        tok = mint_access_token(_CREDS["cid"], _CREDS["csec"], _CREDS["cref"])
+        write_token_file(_CREDS["cid"], _CREDS["csec"], _CREDS["cref"],
+                         tok["access_token"], _CREDS["scopes"],
+                         int(tok.get("expires_in", 3599)) - 60)
+        _last_token_refresh = now
+        return True
+    except Exception as e:
+        log(f"token refresh failed (continuing with cached token): {str(e)[:150]}")
+        return False
+
+
+def gdrive(*args, timeout=300):
+    return sh([sys.executable, GDRIVE_PY, *args], timeout=timeout)
+
+
+def colab(*args, timeout=300):
+    return sh([sys.executable, COLAB_PY, *args], timeout=timeout)
+
+
+def poll_log(deadline, needle="[RESULT]"):
+    last_alive_step = -1
+    last_alive_at = None
+    while time.time() < deadline:
+        # Re-mint the colab token before each poll: the startup token expires
+        # ~59 min in, after which `colab logs` fails with rc=1 even though the
+        # VM is alive — causing a FALSE heartbeat stall (verified live). If the
+        # refresh itself fails, don't count the poll toward a stall: the rc=1
+        # would be an AUTH failure, not proof the VM died.
+        fresh = refresh_colab_token()
+        rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
+        if needle in out or "EXIT" in out or "NOT FOUND" in out:
+            return out
+        # heartbeat stall detection: daily_finetune.py emits [alive] step=N every
+        # 10 steps. If we've seen a heartbeat but the newest one hasn't advanced
+        # for HEARTBEAT_STALL_MIN, the VM is dead (session recycled / OOM-killed)
+        # and the runner should recover the latest checkpoint and fail FAST
+        # instead of polling a corpse until the full timeout budget.
+        import re as _re
+        m = _re.findall(r"\[alive\] step=(\d+)", out)
+        if m:
+            cur = max(int(x) for x in m)
+            if cur > last_alive_step:
+                last_alive_step = cur
+                last_alive_at = time.time()
+            elif last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
+                log(f"HEARTBEAT STALLED: newest [alive] step={cur} unchanged for {HEARTBEAT_STALL_S}s — VM likely dead")
+                return "HEARTBEAT_STALLED"
+        elif rc != 0 and fresh and last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
+            # log unreadable AND we had a heartbeat before AND the token was
+            # fresh (so rc=1 is NOT an auth failure) — treat as dead
+            log(f"HEARTBEAT STALLED: log unreadable (rc={rc}) and no new [alive] for {HEARTBEAT_STALL_S}s")
+            return "HEARTBEAT_STALLED"
+        if rc != 0:
+            # transient colab flakiness or auth failure — keep polling
+            log(f"log poll rc={rc}: {err[-200:]}" + ("" if fresh else " (token refresh failed — not counted as stall)"))
+        time.sleep(90)
+    return None
+
+
+def training_succeeded(final_log):
+    """A run is a SUCCESS only if the VM reported [RESULT] ok=true — the marker
+    daily_finetune.py prints AFTER the adapter passed verify_adapter() and the
+    Drive pushes completed. A bare 'EXIT 1' (e.g. a callback crash) must NOT be
+    treated as success; the old code did exactly that and shipped empty runs."""
+    if not final_log:
+        return False
+    return "[RESULT] ok=true" in final_log or "[RESULT] ok=True" in final_log
+
+
+def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
+    """Pull the newest Drive checkpoint into the adapter_in continuity folder.
+    Called on runner timeout / VM death so the next run resumes from the last
+    saved checkpoint instead of the pre-run adapter."""
+    try:
+        drive = Drive(GDRIVE_PY, str(ADC_FILE))
+        found = find_latest_checkpoint(drive, os.environ.get("DRIVE_RESULTS", ""), run_id)
+        source = "checkpoint"
+        if not found:
+            arch = find_latest_archive(drive, os.environ.get("DRIVE_RESULTS", ""))
+            if arch:
+                folder_id, file_id, file_name, date = arch
+                found = (folder_id, 0, file_id, file_name)
+                source = f"archive results-{date}"
+        if not found:
+            log("no Drive checkpoint or archive found to recover")
+            return False
+        folder_id, step, file_id, file_name = found
+        tmp = pathlib.Path("/tmp/ckpt_recover")
+        tmp.mkdir(exist_ok=True)
+        adapter = tmp / "adapter_model.safetensors"
+        drive.download(file_id, str(adapter))
+        cfg = tmp / "adapter_config.json"
+        if not cfg.exists():
+            for f in drive.list_files(folder_id):
+                if f.get("n") == "adapter_config.json":
+                    drive.download(f.get("id"), str(cfg))
+                    break
+        if not (adapter.exists() and adapter.stat().st_size > 0):
+            log("recovered adapter file is empty/missing")
+            return False
+        # replace adapter_in contents
+        rc, o, e = gdrive("list", "--folder", folder_in, "--max", "50", timeout=120)
+        items = []
+        try:
+            data = json.loads(o or "{}")
+            items = data.get("items", []) if isinstance(data, dict) and isinstance(data.get("items"), list) else []
+        except Exception:
+            items = []
+        for it in items:
+            gdrive("rm", it.get("id", ""), timeout=120) if isinstance(it, dict) and it.get("id") else None
+        gdrive("upload", str(adapter), "--parent", folder_in, "--name", "adapter_model.safetensors", timeout=300)
+        if cfg.exists():
+            gdrive("upload", str(cfg), "--parent", folder_in, "--name", "adapter_config.json", timeout=120)
+        log(f"recovered {source} step-{step} -> adapter_in (next run resumes from it)")
+        return True
+    except Exception as e:
+        log(f"checkpoint recovery failed: {e}")
+        return False
+
+
+def main():
+    # --- secrets ---
+    cid = os.environ["COLAB_CLIENT_ID"]
+    csec = os.environ["COLAB_CLIENT_SECRET"]
+    cref = os.environ["COLAB_REFRESH_TOKEN"]
+    adc = os.environ["GDRIVE_ADC"]
+    folder_in = os.environ["DRIVE_ADAPTER_IN"]
+    folder_out = os.environ["DRIVE_RESULTS"]
+    rows = os.environ.get("RUN_ROWS", "2000")
+    save_steps = os.environ.get("RUN_SAVE_STEPS", "100")
+    max_minutes = os.environ.get("RUN_MAX_MINUTES", "100")
+    epochs = os.environ.get("RUN_EPOCHS", "1")
+    unlimited = max_minutes.strip() in ("", "0")
+    seed = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    # UNIQUE run id (date+time): same-day re-runs must write into their OWN
+    # checkpoint folder. With a date-only run_id two runs collide on the same
+    # step-N filenames and find_latest_checkpoint can restore the OLD adapter
+    # on a tie (key > best[0] fails) — silently breaking continuity.
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # --- auth ---
+    tok = mint_access_token(cid, csec, cref)
+    write_token_file(cid, csec, cref, tok["access_token"],
+                     ["openid",
+                      "https://www.googleapis.com/auth/userinfo.profile",
+                      "https://www.googleapis.com/auth/userinfo.email",
+                      "https://www.googleapis.com/auth/cloud-platform",
+                      "https://www.googleapis.com/auth/colaboratory",
+                      "https://www.googleapis.com/auth/drive.file"],
+                     int(tok.get("expires_in", 3599)) - 60)
+    write_adc_file(adc)
+    # Store creds for in-process token refresh (keeps `colab logs` working past
+    # the initial ~59-min token expiry — without it the runner falsely declares
+    # HEARTBEAT_STALLED and stops a healthy VM).
+    set_colab_creds(cid, csec, cref,
+                    ["openid",
+                     "https://www.googleapis.com/auth/userinfo.profile",
+                     "https://www.googleapis.com/auth/userinfo.email",
+                     "https://www.googleapis.com/auth/cloud-platform",
+                     "https://www.googleapis.com/auth/colaboratory",
+                     "https://www.googleapis.com/auth/drive.file"])
+
+    # --- sanity: gdrive works headlessly (ADC can be inline JSON or path) ---
+    rc, out, err = gdrive("about", timeout=120)
+    log(f"gdrive about: rc={rc} {out[:160]}")
+    if rc != 0:
+        log(f"gdrive about FAILED (continuing, will retry on upload): {err[-300:]}")
+
+    # --- session (retry on transient quota exhaustion: free T4 quota is
+    # ~3-4 sessions/account/day and `gpu-unavailable` is common at peak) ---
+    # First clean up any orphaned assignment from a previous run that was
+    # cancelled mid-flight (a cancelled GH run never ran `colab stop`, so the
+    # VM keeps occupying the account's concurrent-assignment slot and `new`
+    # fails with "Precondition Failed"). `recover` rebuilds the local registry
+    # from server-side list_assignments(), then `stop` releases the orphan.
+    log("pre-session cleanup: recovering any orphaned assignment on this account")
+    rc, out, err = colab("recover", timeout=120)
+    log(f"recover: rc={rc} {out[-160:]} {err[-160:]}")
+    rc, out, err = colab("stop", "-s", SESSION, timeout=120)
+    log(f"pre-clean stop: rc={rc} {out[-160:]} {err[-160:]}")
+
+    rc, out, err = 1, "", ""
+    for attempt in range(4):
+        rc, out, err = colab("new", "-s", SESSION, "--gpu", "T4", timeout=300)
+        log(f"new session attempt {attempt+1}: rc={rc} {out[-200:]} {err[-200:]}")
+        if rc == 0:
+            break
+        combined = str(out) + str(err)
+        if attempt < 3 and ("gpu-unavailable" in combined or "Precondition Failed" in combined or "too many" in combined.lower()):
+            log("GPU quota / assignment contention — cleaning orphans and waiting 300s before retry")
+            # Re-run the cleanup between attempts: a concurrent run (or a
+            # cancelled one still winding down) can hold the slot.
+            colab("recover", timeout=120)
+            colab("stop", "-s", SESSION, timeout=120)
+            time.sleep(300)
+        else:
+            break
+    if rc != 0:
+        raise SystemExit(f"failed to create T4 session: {str(out)[-500:] or str(err)[-500:]}")
+    # Colab idle-prunes free VMs whose keep-alive dies (~60 min). The colab-cli's
+    # own daemon caches the startup token (expires ~59 min) and dies — we run our
+    # own ping loop for the whole poll window instead.
+    keep_alive_stop = _start_keep_alive(SESSION)
+    # --- upload training scripts + Drive tooling to the VM ---
+    for local, remote in [
+        (str(REPO / "daily_finetune.py"), "/content/daily_finetune.py"),
+        (str(REPO / "gdrive.py"), "/content/gdrive.py"),
+        (str(REPO / "pubmed_ingest.py"), "/content/pubmed_ingest.py"),
+        (str(REPO / "egtkg_build.py"), "/content/egtkg_build.py"),
+    ]:
+        rc, o, e = colab("upload", "-s", SESSION, local, remote, timeout=180)
+        if rc != 0:
+            raise SystemExit(f"upload {local} failed: {e[-500:]}")
+    # ADC JSON as a file on the VM (gdrive.py GDRIVE_ADC=path form)
+    adc_local = pathlib.Path("/tmp/gdrive_adc.json")
+    adc_local.write_text(adc)
+    rc, o, e = colab("upload", "-s", SESSION, str(adc_local), "/content/gdrive_adc.json", timeout=180)
+    if rc != 0:
+        raise SystemExit(f"upload ADC failed: {e[-500:]}")
+
+    # --- write + launch launcher (detached, logs to /content/train.log) ---
+    launcher = pathlib.Path("/tmp/launch_daily.py")
+    launcher.write_text(f"""import subprocess, sys
+cmd = [sys.executable, '/content/daily_finetune.py',
+       '--rows', '{rows}', '--seed', '{seed}',
+       '--adapter-from-drive', '{folder_in}',
+       '--adapter-out', '{folder_in}',
+       '--drive-results', '{folder_out}',
+       '--gdrive-py', '/content/gdrive.py',
+       '--adc-file', '/content/gdrive_adc.json',
+       '--run-id', '{run_id}',
+       '--save-steps', '{save_steps}',
+       '--max-minutes', '{max_minutes}',
+       '--epochs', '{epochs}',
+       '--out', '/content/out']
+print('LAUNCH ' + ' '.join(cmd), flush=True)
+r = subprocess.run(cmd)
+print('EXIT ' + str(r.returncode), flush=True)
+sys.exit(r.returncode)
+""")
+    rc, out, err = colab("exec_detach", "-s", SESSION, "-f", str(launcher),
+                         "--log", "/content/train.log", timeout=300)
+    log(f"exec_detach: rc={rc} {out[-200:]} {err[-200:]}")
+    if rc != 0:
+        # Don't poll a log that will never appear — fail fast with the error.
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit(f"exec_detach failed (session stopped): {out[-400:] or err[-400:]}")
+
+    # --- poll ---
+    deadline = time.time() + TRAIN_TIMEOUT_S
+    log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s")
+    final = poll_log(deadline)
+    if final == "HEARTBEAT_STALLED":
+        # VM died mid-training (session recycled / OOM). Recover the newest
+        # checkpoint so the next run resumes from real progress, fail fast.
+        log("HEARTBEAT STALLED: VM appears dead — recovering latest checkpoint and stopping")
+        _stop_keep_alive(keep_alive_stop)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit("VM heartbeat stalled (training died); latest Drive checkpoint recovered into adapter_in")
+    if final is None:
+        if unlimited:
+            # max_minutes=0: the VM self-stops only when the Colab session is
+            # recycled (~12h). The runner's poll budget is finite, so when it
+            # expires we LEAVE THE SESSION RUNNING — training continues
+            # detached on the VM, and the Drive checkpoints keep flowing.
+            log("UNLIMITED MODE: runner poll budget reached; training continues detached on the VM")
+            log("leaving session RUNNING — checkpoints keep being pushed to Drive until VM recycle")
+            recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+            log("latest Drive checkpoint recovered into adapter_in (next run resumes from real progress)")
+            log("DONE (unlimited mode — session NOT stopped)")
+            print("\n[run_daily] SUCCESS — training continues detached; Drive checkpoints accumulating", flush=True)
+            return
+        log("TIMEOUT: training did not finish in time (Colab may have recycled the session)")
+        # The VM pushes checkpoints to Drive as it trains — recover the newest
+        # one so the next run resumes from real progress, not the pre-run adapter.
+        _stop_keep_alive(keep_alive_stop)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
+    log(f"training log tail:\n{final[-2000:]}")
+    if not training_succeeded(final):
+        # Training ran but did NOT finish cleanly (callback crash, OOM, ...).
+        # Recover whatever checkpoint the VM pushed before dying so tomorrow
+        # resumes from real progress, then fail loudly — never report SUCCESS.
+        _stop_keep_alive(keep_alive_stop)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit(f"training failed on the VM (no [RESULT] ok=true in log): {final[-800:]}")
+
+    # --- download results (best-effort; Drive continuity is already done by VM) ---
+    outdir = pathlib.Path("out")
+    outdir.mkdir(exist_ok=True)
+    results = {}
+    for remote, local in [
+        ("/content/out/adapter_model.safetensors", "out/adapter_model.safetensors"),
+        ("/content/out/adapter_config.json", "out/adapter_config.json"),
+        ("/content/out/metrics.json", "out/metrics.json"),
+    ]:
+        rc, o, e = colab("download", "-s", SESSION, remote, local, timeout=300)
+        results[local] = rc == 0 and pathlib.Path(local).exists()
+        log(f"download {local}: rc={rc} exists={results[local]}")
+    if not results["out/adapter_model.safetensors"]:
+        log("WARNING: adapter download failed — VM already pushed it to Drive (adapter_in + archive)")
+
+    # --- stop session (free tier: don't leave it idle) ---
+    _stop_keep_alive(keep_alive_stop)
+    colab("stop", "-s", SESSION, timeout=120)
+
+    log("DONE")
+    print("\n[run_daily] SUCCESS — adapter + checkpoints on Drive", flush=True)
+
+
+if __name__ == "__main__":
+    main()

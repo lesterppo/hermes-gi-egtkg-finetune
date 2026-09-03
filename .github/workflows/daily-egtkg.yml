@@ -1,0 +1,84 @@
+name: Daily GI/Hep EGT-KG Fine-tune (Colab T4 → Google Drive)
+
+on:
+  schedule:
+    # 10:40 PM HKT (14:40 UTC) daily — after PubMed/EUPMC daily index update
+    - cron: "40 14 * * *"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "evidence QA rows to train on (smoke 300 / daily 3000)"
+        required: false
+        default: "3000"
+      save_steps:
+        description: "Drive checkpoint every N training steps"
+        required: false
+        default: "50"
+      max_minutes:
+        description: "Stop training after N minutes (0=unlimited); 240 = full daily epoch"
+        required: false
+        default: "240"
+      ingest_days:
+        description: "how many days back to pull fresh GI/hepatology evidence"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gi-egtkg
+  cancel-in-progress: false
+
+jobs:
+  finetune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runner deps
+        run: pip install -r requirements.txt
+
+      - name: Patch colab-cli 0.6.0 jupyter-kernel-client compat
+        # google-colab-cli 0.6.0's runtime.py calls jupyter_kernel_client.KernelClient,
+        # renamed JupyterKernelClient in v1.0.0 -> AttributeError on exec_detach.
+        run: |
+          python - <<'EOF'
+          import pathlib, colab_cli.runtime
+          p = pathlib.Path(colab_cli.runtime.__file__)
+          s = p.read_text()
+          f = s.replace("jupyter_kernel_client.KernelClient(", "jupyter_kernel_client.JupyterKernelClient(")
+          if f != s:
+              p.write_text(f); print("patched KernelClient -> JupyterKernelClient")
+          else:
+              print("no patch needed")
+          EOF
+
+      - name: Run daily EGT-KG fine-tune
+        env:
+          COLAB_CLIENT_ID: ${{ secrets.COLAB_CLIENT_ID }}
+          COLAB_CLIENT_SECRET: ${{ secrets.COLAB_CLIENT_SECRET }}
+          COLAB_REFRESH_TOKEN: ${{ secrets.COLAB_REFRESH_TOKEN }}
+          GDRIVE_ADC: ${{ secrets.GDRIVE_ADC }}
+          DRIVE_ADAPTER_IN: ${{ secrets.DRIVE_ADAPTER_IN }}
+          DRIVE_RESULTS: ${{ secrets.DRIVE_RESULTS }}
+          RUN_ROWS: ${{ github.event.inputs.rows || '3000' }}
+          RUN_SAVE_STEPS: ${{ github.event.inputs.save_steps || '50' }}
+          RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '240' }}
+          INGEST_DAYS: ${{ github.event.inputs.ingest_days || '20' }}
+        run: python run_daily.py
+
+      - name: Upload artifacts (metrics + adapter config)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egtkg-output
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,7 @@
+# Runner-side deps (GitHub Actions ubuntu). The heavy ML stack (torch,
+# transformers, peft, trl, bitsandbytes) is installed ON the Colab VM by
+# daily_finetune.py — not here.
+google-colab-cli>=0.6.0
+google-api-python-client>=2.0
+google-auth>=2.0
+google-auth-httplib2>=0.1

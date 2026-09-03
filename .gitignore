@@ -1,0 +1,17 @@
+# tokens / credentials — never commit
+*.json
+!requirements.txt
+!colab.py
+!gdrive.py
+!egtkg_build.py
+!pubmed_ingest.py
+!run_daily.py
+!daily_finetune.py
+!AGENTS.md
+!README.md
+!requirements.txt
+# runner artifacts
+out/
+test/
+__pycache__/
+*.log
