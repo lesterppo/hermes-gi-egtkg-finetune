@@ -428,6 +428,21 @@ def build_data(n_rows: int, seed: int, out_path: str) -> int:
     print(f"[data] ingest rc={r_ing.returncode}", flush=True)
     time.sleep(1)
 
+    # Reference/textbook corpus (StatPearls 171 chapters + NIDDK 56 + WGO 26).
+    # Stable knowledge — refresh only on the 1st of the month (cheap: ~250
+    # pages, ~10 min) or when missing locally. Mixed into the same store so
+    # egtkg_build sees literature + reference knowledge together.
+    ref_path = "/content/ref_store.jsonl"
+    need_ref = (not os.path.exists(ref_path)) or time.strftime("%d") == "01"
+    if need_ref and os.path.exists("/content/textbook_ingest.py"):
+        print("[data] refreshing textbook/reference corpus", flush=True)
+        r_ref = run(f"{sys.executable} /content/textbook_ingest.py "
+                    f"--out {ref_path} --sources statpearls,niddk,wgo")
+        print(f"[data] textbook rc={r_ref.returncode}", flush=True)
+    if os.path.exists(ref_path):
+        run(f"cat {ref_path} >> {store_path}")
+    time.sleep(1)
+
     cap = max(200, n_rows)
     r_build = run(f"{sys.executable} {build_py} --store {store_path} "
                   f"--out {out_path} --limit {cap} --seed {seed}")
