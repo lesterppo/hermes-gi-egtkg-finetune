@@ -441,6 +441,16 @@ def build_data(n_rows: int, seed: int, out_path: str) -> int:
         print(f"[data] textbook rc={r_ref.returncode}", flush=True)
     if os.path.exists(ref_path):
         run(f"cat {ref_path} >> {store_path}")
+
+    # Open-access case reports (CC-licensed PMC): clinical-reasoning chains
+    # (presentation -> workup -> diagnosis -> management) that abstracts
+    # compress away. 180d window, newest 40/run, dedup by CR_ pmid key.
+    if os.path.exists("/content/cases_ingest.py"):
+        r_cr = run(f"{sys.executable} /content/cases_ingest.py "
+                   f"--store /content/cr_store.jsonl --max 40")
+        print(f"[data] case reports rc={r_cr.returncode}", flush=True)
+        if os.path.exists("/content/cr_store.jsonl"):
+            run(f"cat /content/cr_store.jsonl >> {store_path}")
     time.sleep(1)
 
     cap = max(200, n_rows)

@@ -469,6 +469,7 @@ def main():
         (str(REPO / "pubmed_ingest.py"), "/content/pubmed_ingest.py"),
         (str(REPO / "egtkg_build.py"), "/content/egtkg_build.py"),
         (str(REPO / "textbook_ingest.py"), "/content/textbook_ingest.py"),
+        (str(REPO / "cases_ingest.py"), "/content/cases_ingest.py"),
     ]:
         rc, o, e = colab("upload", "-s", SESSION, local, remote, timeout=180)
         if rc != 0:
