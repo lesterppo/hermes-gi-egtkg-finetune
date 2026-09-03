@@ -124,6 +124,38 @@ class Drive:
             data = _json.loads(pathlib.Path(self.adc_file).read_text())
             if data.get("type") != "authorized_user":
                 return None
+            # Discover the quota project the same way the vendored gdrive.py
+            # does (ADC client -> owned project with Drive API enabled).
+            quota_project = None
+            try:
+                tok = _json.loads(_json.dumps(data))
+                import urllib.request as _u
+                import urllib.parse as _up
+                _body = _up.urlencode({
+                    "client_id": tok.get("client_id", ""),
+                    "client_secret": tok.get("client_secret", ""),
+                    "refresh_token": tok.get("refresh_token", ""),
+                    "grant_type": "refresh_token",
+                }).encode()
+                _req = _u.Request("https://oauth2.googleapis.com/token", data=_body,
+                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+                _at = _json.loads(_u.urlopen(_req, timeout=30).read()).get("access_token")
+                _hr = _u.Request(
+                    "https://cloudresourcemanager.googleapis.com/v1/projects"
+                    "?filter=labels.goog-owners-responsibility%3A%22%22&pageSize=1",
+                    headers={"Authorization": f"Bearer {_at}",
+                             "x-goog-user-project": ""})
+                # simple non-filtered list (first owned project is the gcloud default)
+                _hr = _u.Request("https://cloudresourcemanager.googleapis.com/v1/projects?pageSize=5",
+                                 headers={"Authorization": f"Bearer {_at}"})
+                _pj = _json.loads(_u.urlopen(_hr, timeout=30).read())
+                for _p in _pj.get("projects", []):
+                    quota_project = _p.get("projectId")
+                    break
+            except Exception:
+                quota_project = None
+            if not quota_project:
+                return None  # in-process path unusable without quota project
             creds = Credentials(
                 token=None,
                 refresh_token=data.get("refresh_token"),
@@ -131,6 +163,13 @@ class Drive:
                 client_id=data.get("client_id"),
                 client_secret=data.get("client_secret"),
                 scopes=[self.SCOPE],
+                # quota project: ADC from the gcloud client REQUIRES a quota
+                # project on Drive calls, else 403
+                # ("authenticating by using local Application Default
+                # Credentials..."). Discover it from the ADC's own client id
+                # via cloudresourcemanager (matches the gdrive.py vendored
+                # CLI behaviour) and pass it on every request below.
+                quota_project_id=quota_project,
             )
             creds.refresh(Request())
             self._api = build("drive", "v3", credentials=creds, cache_discovery=False)
