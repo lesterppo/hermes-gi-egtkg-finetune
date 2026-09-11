@@ -368,12 +368,31 @@ def push_checkpoint(drive, run_folder, step, local_dir, keep=2):
     print(f"[drive] checkpoint step-{step} pushed to Drive ({len(files)} step files, keeping {keep})", flush=True)
 
 
+def purge_names(drive, folder, names, passes=4):
+    """Delete every file in `folder` whose name is in `names`, re-listing until
+    the listing stops showing them.
+
+    Drive listings are eventually consistent, so a single delete pass leaves
+    stale copies behind: by 2026-09-11 adapter_in had accumulated 11 past
+    adapter pairs (every nightly recovery + VM final push), which makes
+    `gdown --folder` consumers pick an arbitrary/older adapter.
+    """
+    want = set(names)
+    for _ in range(passes):
+        for f in drive.list_files(folder, max_n=200):
+            if isinstance(f, dict) and f.get("n") in want:
+                drive.rm(f.get("id"))
+        remaining = {f.get("n") for f in drive.list_files(folder, max_n=200) if isinstance(f, dict)}
+        if not (remaining & want):
+            return True
+    return False
+
+
 def push_adapter_in(drive, adapter_out_folder, local_dir):
     """Replace the 'latest adapter' continuity folder contents. Best-effort."""
     if not drive or not adapter_out_folder:
         return
-    for f in drive.list_files(adapter_out_folder):
-        drive.rm(f.get("id"))
+    purge_names(drive, adapter_out_folder, ("adapter_model.safetensors", "adapter_config.json"))
     for name in ("adapter_model.safetensors", "adapter_config.json"):
         p = os.path.join(local_dir, name)
         if os.path.exists(p):
@@ -625,6 +644,12 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                         "loss": loss,
                         "ram": ram,
                     }))
+                    # replace, don't accumulate: a same-name upload creates a NEW
+                    # Drive file, so a 240-min run would otherwise leave ~70
+                    # heartbeat.json copies in the run folder
+                    for f in self.drive.list_files(self.run_folder):
+                        if isinstance(f, dict) and f.get("n") == "heartbeat.json":
+                            self.drive.rm(f.get("id"))
                     self.drive.upload(hb, self.run_folder, "heartbeat.json")
                 except Exception as e:
                     print(f"[drive] heartbeat push failed: {str(e)[:150]}", flush=True)

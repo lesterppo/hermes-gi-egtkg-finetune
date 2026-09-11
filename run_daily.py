@@ -386,20 +386,53 @@ def drive_run_result(results_folder, run_id):
     return None
 
 
-def poll_log(deadline, needle="[RESULT]", results_folder=None, run_id=None):
+def wait_for_drive_result(results_folder, run_id, wait_s, poll_s=None):
+    """Poll Drive for this run's result.json for up to wait_s. Returns
+    (ok, payload) or None.
+
+    Used as the SETTLE step before any recovery: a run that pushed
+    result.json{ok:true} has fully finished (verify + archive + adapter_in all
+    happened BEFORE that file was written), so it must not be reported as a
+    failure, and adapter_in must not be rewritten from a mid-run checkpoint.
+    Live evidence for why: run 34624713317 — the runner timed out at 18:36:29
+    and recovered step-150 at 18:38:58, while the VM was finalizing and pushed
+    result.json at 18:40:11.
+    """
+    if poll_s is None:
+        poll_s = RECOVER_POLL_S
+    t0 = time.time()
+    while True:
+        res = drive_run_result(results_folder, run_id)
+        if res is not None:
+            return res
+        if time.time() - t0 >= wait_s:
+            return None
+        time.sleep(poll_s)
+
+
+def poll_log(deadline, needle="[RESULT]", results_folder=None, run_id=None,
+             train_budget_s=None):
     """Poll the VM log until the run finishes, or decide the VM is dead.
 
     Death is declared only when BOTH channels are stale for HEARTBEAT_STALL_S:
       * the newest [alive] heartbeat read from the VM log, and
       * the newest artifact mtime in this run's Drive checkpoint folder.
-    The log channel alone is NOT sufficient — `colab logs` starts failing with
-    rc=1 at ~60 min (token lifetime) while the VM keeps training, and the old
+    The log channel alone is NOT sufficient — `colab logs`/`exec` starts
+    returning {"err":"not-found"} at ~60 min while the VM keeps training, and a
     log-only rule killed a healthy VM every night.
+
+    The poll deadline is also ADAPTIVE: the budget passed in is measured from
+    exec_detach, but the VM spends ~30 min on pip installs, ingest and model load
+    before step 1. Once training is first seen alive, the deadline becomes at
+    least (now + train_budget_s), so a slow setup can no longer cut the training
+    window short (run 34624713317 timed out 4 min before the VM finished).
     """
     last_alive_step = -1
     last_alive_at = None
     progress_at = None          # newest proof of life from either channel
     log_dead_since = None       # when the log channel first went unreadable
+    training_started_at = None  # first heartbeat seen (either channel)
+    recover_attempts = 0
     while time.time() < deadline:
         fresh = refresh_colab_token()
         rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
@@ -409,9 +442,21 @@ def poll_log(deadline, needle="[RESULT]", results_folder=None, run_id=None):
             log("log poll auth-expired — forcing token refresh and retrying once")
             refresh_colab_token(force=True)
             rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
+        if rc != 0 and ("not-found" in str(out or "") or "NOT FOUND" in str(out or "")) \
+                and recover_attempts < 2:
+            # The exec/log channel loses its session mapping (colab-cli reports
+            # "not-found", not an auth error). `colab recover` rebuilds
+            # sessions.json from the server-side assignment list — try it before
+            # giving up on the primary channel entirely.
+            recover_attempts += 1
+            log(f"log channel reports not-found — running `colab recover` "
+                f"(attempt {recover_attempts}) and retrying")
+            colab("recover", timeout=120)
+            rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
         if needle in out or "EXIT" in out or "NOT FOUND" in out:
             return out
         now = time.time()
+
         if rc == 0:
             log_dead_since = None
         elif log_dead_since is None:
@@ -446,6 +491,19 @@ def poll_log(deadline, needle="[RESULT]", results_folder=None, run_id=None):
                     f"(log channel was dead, so [RESULT] came from Drive)")
                 return (f"[RESULT] ok={'true' if ok else 'false'} (via Drive result.json) "
                         f"{json.dumps(payload)}")
+        # once training is seen alive, the deadline must cover the TRAINING
+        # budget from here, not from exec_detach — setup (pip installs, PubMed
+        # ingest, model load) eats ~30 min before step 1 and does not count
+        # toward --max-minutes on the VM.
+        if progress_at is not None and training_started_at is None:
+            training_started_at = progress_at
+            if train_budget_s:
+                extended = training_started_at + train_budget_s
+                if extended > deadline:
+                    deadline = extended
+                    log(f"training started — poll deadline extended to cover "
+                        f"{int(train_budget_s)}s of training "
+                        f"({int((deadline - now) / 60)} min left)")
         # auth-expired or any rc!=0: surface stdout too — colab.py `die()` writes
         # {"ok":false,"err":...} to STDOUT, so logging stderr alone hid the real
         # cause for 8 straight nights.
@@ -533,16 +591,24 @@ def recover_latest_checkpoint_to_adapter_in(folder_in, run_id, baseline_activity
         if not (adapter.exists() and adapter.stat().st_size > 0):
             log("recovered adapter file is empty/missing")
             return False
-        # replace adapter_in contents
-        rc, o, e = gdrive("list", "--folder", folder_in, "--max", "50", timeout=120)
-        items = []
-        try:
-            data = json.loads(o or "{}")
-            items = data.get("items", []) if isinstance(data, dict) and isinstance(data.get("items"), list) else []
-        except Exception:
+        # replace adapter_in contents — purge by NAME in a loop: Drive listings
+        # are eventually consistent, so one delete pass leaves stale adapter
+        # copies behind (adapter_in had accumulated 11 pairs by 2026-09-11,
+        # which makes gdown --folder consumers pick an arbitrary old adapter).
+        for _ in range(3):
+            rc, o, e = gdrive("list", "--folder", folder_in, "--max", "200", timeout=120)
             items = []
-        for it in items:
-            gdrive("rm", it.get("id", ""), timeout=120) if isinstance(it, dict) and it.get("id") else None
+            try:
+                data = json.loads(o or "{}")
+                items = data.get("items", []) if isinstance(data, dict) and isinstance(data.get("items"), list) else []
+            except Exception:
+                items = []
+            stale = [it for it in items if isinstance(it, dict) and it.get("id")
+                     and it.get("n") in ("adapter_model.safetensors", "adapter_config.json")]
+            for it in stale:
+                gdrive("rm", it["id"], timeout=120)
+            if not stale:
+                break
         gdrive("upload", str(adapter), "--parent", folder_in, "--name", "adapter_model.safetensors", timeout=300)
         if cfg.exists():
             gdrive("upload", str(cfg), "--parent", folder_in, "--name", "adapter_config.json", timeout=120)
@@ -551,6 +617,39 @@ def recover_latest_checkpoint_to_adapter_in(folder_in, run_id, baseline_activity
     except Exception as e:
         log(f"checkpoint recovery failed: {e}")
         return False
+
+
+def finish_incomplete(folder_in, folder_out, run_id, keep_alive_stop, reason, detail=""):
+    """Terminal handling for any non-[RESULT] exit: settle, then recover.
+
+    1. SETTLE: give the VM up to RECOVER_WAIT_S to push result.json. If it says
+       ok=true the run actually COMPLETED (verify + archive + adapter_in all ran
+       before that file was written) — the log channel was just dead, so report
+       SUCCESS and DO NOT touch adapter_in.
+    2. Otherwise recover the newest checkpoint (with its own grace wait) and fail
+       loudly with `reason`.
+    """
+    log(f"settling on Drive for up to {RECOVER_WAIT_S}s before recovery ({reason})")
+    res = wait_for_drive_result(folder_out, run_id, RECOVER_WAIT_S)
+    if res and res[0]:
+        payload = res[1]
+        outdir = pathlib.Path("out")
+        outdir.mkdir(exist_ok=True)
+        (outdir / "metrics.json").write_text(json.dumps(payload, indent=2))
+        _stop_keep_alive(keep_alive_stop)
+        colab("stop", "-s", SESSION, timeout=120)
+        log(f"run actually COMPLETED (result.json on Drive): steps={payload.get('steps')} "
+            f"loss={payload.get('loss')} partial={payload.get('partial')} — "
+            f"adapter archived by the VM (adapter_in + results-<date>/), adapter_in NOT overwritten")
+        print(f"\n[run_daily] SUCCESS — {reason}, but the VM finished cleanly "
+              f"(result.json ok=true on Drive); adapter + archive are on Drive", flush=True)
+        return True
+    if res is not None:
+        log(f"VM reported ok=false on Drive ({res[1]}) — treating as a failed run")
+    _stop_keep_alive(keep_alive_stop)
+    recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
+    colab("stop", "-s", SESSION, timeout=120)
+    raise SystemExit(f"{reason}{': ' + detail if detail else ''} — latest Drive checkpoint recovered into adapter_in")
 
 
 def main():
@@ -685,19 +784,22 @@ sys.exit(r.returncode)
 
     # --- poll ---
     deadline = time.time() + TRAIN_TIMEOUT_S
+    max_minutes = int(float(max_minutes)) if str(max_minutes).strip() else 100
+    # training budget handed to poll_log for the adaptive deadline: the VM's own
+    # --max-minutes plus slack for the final save + archive + adapter_in pushes
+    train_budget_s = (max_minutes + 20) * 60 if max_minutes > 0 else 240 * 60
     log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s "
-        f"(stall window {HEARTBEAT_STALL_S}s, both channels)")
-    final = poll_log(deadline, results_folder=folder_out, run_id=run_id)
+        f"(stall window {HEARTBEAT_STALL_S}s on BOTH channels; deadline extends to "
+        f"{train_budget_s}s after training starts)")
+    final = poll_log(deadline, results_folder=folder_out, run_id=run_id,
+                     train_budget_s=train_budget_s)
     if final == "HEARTBEAT_STALLED":
         # Both liveness channels (VM log AND Drive checkpoints) went quiet for
         # the stall window — the VM really is gone (session recycled / OOM).
-        # Recover the newest checkpoint (waiting briefly in case a late push
-        # lands) and fail fast.
-        log("HEARTBEAT STALLED: VM appears dead — recovering latest checkpoint and stopping")
-        _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
-        colab("stop", "-s", SESSION, timeout=120)
-        raise SystemExit("VM heartbeat stalled (training died); latest Drive checkpoint recovered into adapter_in")
+        log("HEARTBEAT STALLED: VM appears dead — settling, then recovering the newest checkpoint")
+        if finish_incomplete(folder_in, folder_out, run_id, keep_alive_stop,
+                             "VM heartbeat stalled (training died)"):
+            return
     if final is None:
         if unlimited:
             # max_minutes=0: the VM self-stops only when the Colab session is
@@ -712,21 +814,23 @@ sys.exit(r.returncode)
             print("\n[run_daily] SUCCESS — training continues detached; Drive checkpoints accumulating", flush=True)
             return
         log("TIMEOUT: training did not finish in time (Colab may have recycled the session)")
-        # The VM pushes checkpoints to Drive as it trains — recover the newest
-        # one so the next run resumes from real progress, not the pre-run adapter.
-        _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
-        colab("stop", "-s", SESSION, timeout=120)
-        raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
+        if finish_incomplete(folder_in, folder_out, run_id, keep_alive_stop,
+                             "training timed out"):
+            return
+    if final is None:
+        # unreachable: finish_incomplete() either returns True (VM finished) or
+        # raises SystemExit (checkpoint recovered). Guard keeps this explicit.
+        return
     log(f"training log tail:\n{final[-2000:]}")
     if not training_succeeded(final):
         # Training ran but did NOT finish cleanly (callback crash, OOM, ...).
-        # Recover whatever checkpoint the VM pushed before dying so tomorrow
-        # resumes from real progress, then fail loudly — never report SUCCESS.
-        _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
-        colab("stop", "-s", SESSION, timeout=120)
-        raise SystemExit(f"training failed on the VM (no [RESULT] ok=true in log): {final[-800:]}")
+        # Settle first (a late result.json ok=true means it DID finish), else
+        # recover whatever checkpoint the VM pushed — never report SUCCESS on a
+        # run that produced nothing.
+        if finish_incomplete(folder_in, folder_out, run_id, keep_alive_stop,
+                             "training failed on the VM (no [RESULT] ok=true in log)",
+                             detail=final[-800:]):
+            return
 
     # --- download results (best-effort; Drive continuity is already done by VM) ---
     outdir = pathlib.Path("out")

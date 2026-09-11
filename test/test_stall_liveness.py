@@ -153,12 +153,73 @@ def test_drive_result_json_is_the_success_signal():
     check("Drive result ok=false -> not success", rd.training_succeeded(out) is False, f"{out!r}")
 
 
+def test_adaptive_deadline_covers_slow_setup():
+    """Setup (~30 min) must not eat the training window (run 34624713317 timed
+    out 4 min before the VM pushed result.json)."""
+    rd.POLL_INTERVAL_S = 1
+    rd.POLL_INTERVAL_DARK_S = 1
+    rd.HEARTBEAT_STALL_S = 999
+    rd.refresh_colab_token = lambda force=False: True
+    state = {"n": 0}
+
+    def logs(*a, **k):
+        state["n"] += 1
+        # heartbeat only on the 3rd poll, then the log channel dies
+        if state["n"] == 3:
+            return (0, "[alive] step=10 loss=0.5 ram=9/12GB", "")
+        return (1, '{"ok": false, "err": "not-found", "msg": "Not found."}', "")
+
+    rd.colab = logs
+    rd.drive_run_activity = lambda folder, run_id: time.time() - 5
+    rd.drive_run_result = lambda folder, run_id: None
+    t0 = time.time()
+    # caller budget expires in 2s (stand-in for a budget eaten by setup);
+    # training budget of 6s must extend it past that
+    out = rd.poll_log(t0 + 2, results_folder="F", run_id="R", train_budget_s=6)
+    elapsed = time.time() - t0
+    check("deadline extended past the caller budget", elapsed > 3, f"elapsed={elapsed:.1f}s")
+    check("adaptive poll ended by the extended deadline", out is None, f"{out!r}")
+
+
+def test_settle_reports_success_when_vm_finished():
+    """A timeout/stall must check Drive BEFORE overwriting adapter_in."""
+    rd.RECOVER_POLL_S = 1
+    calls = {"stop": 0, "recover": 0}
+    rd.colab = lambda *a, **k: (calls.__setitem__("stop", calls["stop"] + 1) or (0, "stopped", ""))
+    rd._stop_keep_alive = lambda ev: None
+    rd.wait_for_drive_result = lambda folder, run_id, wait_s: (True, {"ok": True, "steps": 194, "loss": 0.44})
+
+    def boom(*a, **k):
+        calls["recover"] += 1
+        raise AssertionError("recovery must NOT run when result.json ok=true")
+
+    rd.recover_latest_checkpoint_to_adapter_in = boom
+    ok = rd.finish_incomplete("IN", "OUT", "R", None, "training timed out")
+    check("settle → SUCCESS when VM finished", ok is True)
+    check("settle → no adapter_in overwrite", calls["recover"] == 0)
+    check("settle → session stopped", calls["stop"] >= 1)
+    check("settle → out/metrics.json written", os.path.exists("out/metrics.json"))
+
+    # no result.json on Drive → real failure path (recover + raise)
+    rd.wait_for_drive_result = lambda folder, run_id, wait_s: None
+    rd.recover_latest_checkpoint_to_adapter_in = lambda *a, **k: calls.__setitem__("recover", calls["recover"] + 1)
+    raised = False
+    try:
+        rd.finish_incomplete("IN", "OUT", "R", None, "training timed out")
+    except SystemExit:
+        raised = True
+    check("no result.json → SystemExit failure", raised is True)
+    check("no result.json → checkpoint recovered", calls["recover"] == 1)
+
+
 if __name__ == "__main__":
     test_parse_iso_and_age()
     test_log_dark_but_drive_fresh_is_not_a_stall()
     test_recovery_waits_for_newer_artifact()
     test_stall_window_exceeds_checkpoint_cadence()
     test_drive_result_json_is_the_success_signal()
+    test_adaptive_deadline_covers_slow_setup()
+    test_settle_reports_success_when_vm_finished()
     print()
     print(f"{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
     sys.exit(1 if FAILS else 0)
