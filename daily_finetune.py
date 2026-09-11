@@ -436,7 +436,13 @@ def push_adapter_in(drive, adapter_out_folder, local_dir):
 
 
 def push_archive(drive, results_folder, date, local_dir, metrics):
-    """Archive final adapter + metrics under results-<date>/. Best-effort."""
+    """Archive final adapter + metrics under results-<date>/. Best-effort.
+
+    Files are REPLACED in place: results-<date>/ is 'that date's final state', so
+    a second run on the same date (smoke test, manual dispatch, retry) must
+    overwrite rather than leave two adapter/metrics copies side by side — which
+    is what happened on 2026-09-11 (two 84MB adapters in one archive folder).
+    """
     if not drive or not results_folder:
         return
     folder = drive.ensure_folder(results_folder, f"results-{date}")
@@ -445,7 +451,7 @@ def push_archive(drive, results_folder, date, local_dir, metrics):
     for name in ("adapter_model.safetensors", "adapter_config.json", "metrics.json", "loss_curve.json"):
         p = os.path.join(local_dir, name)
         if os.path.exists(p):
-            drive.upload(p, folder, name)
+            drive.upload_replace(p, folder, name)
     print(f"[drive] archived to results-{date}", flush=True)
 
 
