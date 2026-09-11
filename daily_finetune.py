@@ -200,6 +200,40 @@ class Drive:
                 print(f"[drive] in-process upload failed ({str(e)[:150]}) — falling back to gdrive.py", flush=True)
         return self._call("upload", local, "--parent", folder, "--name", name, timeout=timeout)
 
+    def upload_replace(self, local, folder, name, timeout=300):
+        """Upload `local` as `name`, REPLACING any existing file of that name.
+
+        Same-name uploads create NEW Drive files, and because Drive listings are
+        eventually consistent a list-then-delete loop still leaves copies behind
+        (observed: heartbeat.json and loss_curve.json accumulating one copy per
+        push). Updating the existing file id in place keeps exactly one file —
+        which is what 'latest state' files (heartbeat/loss_curve) must be.
+        """
+        api = self._get_api()
+        if api is not None:
+            try:
+                import mimetypes
+                existing = None
+                for f in self.list_files(folder, max_n=200):
+                    if isinstance(f, dict) and f.get("n") == name:
+                        existing = f.get("id")
+                        break
+                mime = mimetypes.guess_type(str(local))[0] or "application/octet-stream"
+                media = self._media(str(local), mimetype=mime, resumable=False)
+                if existing:
+                    resp = api.files().update(fileId=existing, media_body=media,
+                                              fields="id,name").execute()
+                    return {"ok": True, "id": resp.get("id"), "name": resp.get("name")}
+                resp = api.files().create(body={"name": name, "parents": [folder]},
+                                          media_body=media, fields="id,name").execute()
+                return {"ok": True, "id": resp.get("id"), "name": resp.get("name")}
+            except Exception as e:
+                print(f"[drive] replace upload failed ({str(e)[:150]}) — falling back", flush=True)
+        for f in self.list_files(folder, max_n=200):
+            if isinstance(f, dict) and f.get("n") == name:
+                self.rm(f.get("id"))
+        return self.upload(local, folder, name, timeout=timeout)
+
     def _call(self, *args, timeout=300):
         try:
             r = subprocess.run(
@@ -567,10 +601,10 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
             elif os.path.exists(os.path.join(args.output_dir, "adapter_model.safetensors")):
                 push_checkpoint(self.drive, self.run_folder, step, args.output_dir)
             # ship the loss curve with every checkpoint so even a killed run
-            # leaves a real training curve on Drive
+            # leaves a real training curve on Drive (replace in place: one file)
             curve = os.path.join(args.output_dir, "loss_curve.json")
             if self.drive and self.run_folder and os.path.exists(curve):
-                r = self.drive.upload(curve, self.run_folder, "loss_curve.json")
+                r = self.drive.upload_replace(curve, self.run_folder, "loss_curve.json")
                 if self.drive.is_ok(r):
                     print(f"[drive] loss_curve.json pushed at step {step}", flush=True)
 
@@ -644,13 +678,10 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                         "loss": loss,
                         "ram": ram,
                     }))
-                    # replace, don't accumulate: a same-name upload creates a NEW
-                    # Drive file, so a 240-min run would otherwise leave ~70
-                    # heartbeat.json copies in the run folder
-                    for f in self.drive.list_files(self.run_folder):
-                        if isinstance(f, dict) and f.get("n") == "heartbeat.json":
-                            self.drive.rm(f.get("id"))
-                    self.drive.upload(hb, self.run_folder, "heartbeat.json")
+                    # replace in place (same-name uploads create NEW Drive files;
+                    # listings are eventually consistent so delete-then-upload
+                    # still leaves copies behind)
+                    self.drive.upload_replace(hb, self.run_folder, "heartbeat.json")
                 except Exception as e:
                     print(f"[drive] heartbeat push failed: {str(e)[:150]}", flush=True)
 
