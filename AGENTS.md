@@ -64,3 +64,26 @@ machine and no API keys needed to run.
 - Heartbeat stall + runner keep-alive, in-process Drive uploads, model-only
   checkpoints, bf16 not fp16, jupyter-kernel-client compat patch, unique
   run-ids, pre-clean orphaned assignments, gpu-unavailable retries.
+- **Liveness must not depend on the VM log alone.** `colab logs`/`colab exec`
+  starts failing with rc=1 about 60 min into a session (colab-cli access-token
+  lifetime; re-minting token.json does not revive it) while training keeps
+  running normally. A log-only stall rule therefore kills healthy VMs: that is
+  exactly what happened nightly — the runner declared HEARTBEAT_STALLED at
+  ~75-82 min and ran `colab stop`, and Drive proves the VM was alive (2026-09-10:
+  stop at 19:08, VM pushed step-100 at 19:16; 2026-09-04: stop then step-150).
+  Current design: TWO channels — the log ([alive] heartbeats) and Drive
+  (`checkpoints/<run_id>/heartbeat.json` every 10 steps + step-N adapters every
+  `--save-steps`) — and the VM is only declared dead when BOTH are quiet for
+  `RUN_STALL_MINUTES` (default 45, must exceed the 25-35 min checkpoint cadence).
+- **Success must not depend on the VM log either.** The VM writes
+  `result.json` (`{ok, run_id, steps, loss, partial}`) into its run folder after
+  verify + archive, and the runner accepts `[RESULT] ok=true` from Drive when the
+  log channel is dark; the colab download step is skipped in that case (same dead
+  channel) and `out/metrics.json` is built from the Drive payload.
+- **Never recover a checkpoint without a grace window.** The VM keeps pushing
+  after the runner gives up, so recovery waits `RUN_RECOVER_WAIT_MINUTES`
+  (default 12) for Drive activity to advance before copying into adapter_in;
+  otherwise the next run resumes from an older step (Sep-10 lost 50 steps this
+  way).
+- Log BOTH stdout and stderr on a failed `colab` call: `colab.py die()` prints
+  `{"ok":false,"err":...}` to STDOUT, so stderr-only logging hides the cause.

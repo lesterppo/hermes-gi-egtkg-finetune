@@ -12,6 +12,7 @@
 !requirements.txt
 # runner artifacts
 out/
-test/
+test/*.jsonl
+test/__pycache__/
 __pycache__/
 *.log

@@ -584,12 +584,22 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
 
     class HeartbeatCallback(TrainerCallback):
         """Emit a `[alive] step=N loss=X ram=Y` line every `every` steps with
-        flush=True so the runner can see training is progressing and detect a
-        dead VM early (no new [alive] for N min = something died). RAM read
-        from /proc/meminfo (free Colab cgroup is ~12GB)."""
+        flush=True so the runner can see training is progressing, AND mirror the
+        same heartbeat to Drive as heartbeat.json.
 
-        def __init__(self, every=10):
+        The Drive copy is the runner's OUT-OF-BAND liveness channel: `colab logs`
+        goes dark after ~60 min (token lifetime) while the VM keeps training, so
+        a log-only stall rule kills healthy VMs (it did, nightly, before this).
+        A fresh heartbeat.json mtime proves the VM is alive without the log.
+
+        RAM read from /proc/meminfo (free Colab cgroup is ~12GB).
+        """
+
+        def __init__(self, every=10, drive=None, run_folder=None, out_dir=None):
             self.every = every
+            self.drive = drive
+            self.run_folder = run_folder
+            self.out_dir = out_dir
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if state.global_step % self.every != 0:
@@ -607,10 +617,22 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
             except Exception:
                 pass
             print(f"[alive] step={state.global_step} loss={loss} ram={ram}", flush=True)
+            if self.drive and self.run_folder and self.out_dir:
+                try:
+                    hb = os.path.join(self.out_dir, "heartbeat.json")
+                    pathlib.Path(hb).write_text(json.dumps({
+                        "step": int(state.global_step),
+                        "loss": loss,
+                        "ram": ram,
+                    }))
+                    self.drive.upload(hb, self.run_folder, "heartbeat.json")
+                except Exception as e:
+                    print(f"[drive] heartbeat push failed: {str(e)[:150]}", flush=True)
 
     budget = TimeBudgetCallback(max_minutes * 60 if max_minutes and max_minutes > 0 else 0)
     curve_cb = LossCurveCallback(out_dir)
-    callbacks = [budget, curve_cb, HeartbeatCallback(every=10)]
+    callbacks = [budget, curve_cb,
+                 HeartbeatCallback(every=10, drive=drive, run_folder=run_folder, out_dir=out_dir)]
     if drive and run_folder:
         callbacks.append(DriveCheckpointCallback(drive, run_folder))
 
@@ -823,6 +845,31 @@ def main():
         store_archive_push(drive, args.drive_results, date, kstore)
         push_archive(drive, args.drive_results, date, args.out, metrics)
         push_adapter_in(drive, args.adapter_out, args.out)
+
+    # --- completion marker for the runner (out-of-band success signal) ---
+    # `colab logs` / `colab exec` starts failing with rc=1 ~60 min into a session
+    # (colab-cli token lifetime) while training keeps running normally. [RESULT]
+    # on stdout is therefore unreadable for the rest of the run, so the runner
+    # needs a success signal that does NOT depend on the log channel: this file,
+    # pushed to the same Drive folder it already watches for liveness.
+    if drive and run_folder:
+        try:
+            res = {
+                "ok": bool(ok),
+                "run_id": run_id,
+                "steps": metrics.get("train_steps"),
+                "loss": metrics.get("train_loss"),
+                "partial": metrics.get("partial"),
+            }
+            rp = pathlib.Path(args.out) / "result.json"
+            rp.write_text(json.dumps(res))
+            r = drive.upload(str(rp), run_folder, "result.json")
+            if drive.is_ok(r):
+                print(f"[drive] result.json pushed (ok={res['ok']} steps={res['steps']})", flush=True)
+            else:
+                print(f"[drive] result.json push failed: {str(r.get('e', ''))[:150]}", flush=True)
+        except Exception as e:
+            print(f"[drive] result.json push failed: {str(e)[:150]}", flush=True)
 
     print(f"\n[RESULT] ok={ok} {json.dumps(metrics)}", flush=True)
     sys.exit(0 if ok else 1)

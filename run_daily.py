@@ -82,12 +82,43 @@ def train_timeout_s():
 
 TRAIN_TIMEOUT_S = train_timeout_s()
 
-# If no new [alive] heartbeat for this long, the VM is dead (session recycled /
-# OOM-killed). Daily_finetune.py emits one every 10 steps (~3-4 min at 20s/step),
-# so 20 min without progress = definitely dead. The runner recovers the latest
-# Drive checkpoint and fails fast instead of polling a corpse for the full
-# TRAIN_TIMEOUT budget.
-HEARTBEAT_STALL_S = 20 * 60
+# Stall detection: a run is only declared DEAD when BOTH liveness channels go
+# quiet for this long — the VM log ([alive] heartbeats) AND Drive (the VM pushes
+# heartbeat.json every 10 steps plus a step-N checkpoint every RUN_SAVE_STEPS).
+#
+# Why both, and why 45 min (was 20 min, log-only):
+#   `colab logs`/`exec` starts returning rc=1 at ~60 min after session create
+#   (the colab-cli access token lives ~59 min; re-minting token.json does not
+#   revive the exec path). The old log-only rule therefore declared
+#   HEARTBEAT_STALLED at ~75-82 min every single night and ran `colab stop` on a
+#   HEALTHY VM — proven from Drive: on 2026-09-10 the runner stopped the session
+#   at 19:08 and the VM still pushed step-100 at 19:16; same on 2026-09-04
+#   (step-150 at 19:09 after the stop). Worse, recovery then overwrote
+#   adapter_in with the OLDER step-50 (step-100 did not exist yet) and the next
+#   run resumed 50 steps behind.
+#   Checkpoint cadence is ~25-35 min, so the window must exceed it.
+HEARTBEAT_STALL_S = int(float(os.environ.get("RUN_STALL_MINUTES", "45"))) * 60
+
+# After a stall is declared, give the VM this long to land one more Drive
+# artifact before we overwrite adapter_in, so the newest checkpoint (not the one
+# that happened to exist at stall time) is what the next run resumes from.
+RECOVER_WAIT_S = int(float(os.environ.get("RUN_RECOVER_WAIT_MINUTES", "12"))) * 60
+RECOVER_POLL_S = 30
+
+# Poll cadence: slower while the log channel is healthy (each poll spawns a
+# colab.py subprocess), faster once it goes dark and we are watching Drive.
+POLL_INTERVAL_S = int(float(os.environ.get("RUN_POLL_INTERVAL_S", "90")))
+POLL_INTERVAL_DARK_S = int(float(os.environ.get("RUN_POLL_INTERVAL_DARK_S", "60")))
+
+# Last Drive artifact mtime (epoch) observed while polling — handed to recovery
+# as the baseline so it can wait for a newer checkpoint instead of copying a
+# stale one.
+_LAST_DRIVE_AT = None
+
+# Set when [RESULT] was read from Drive (log channel dead) instead of the VM
+# log — the download step is then pointless (same dead channel) because the VM
+# already pushed adapter_in + results-<date>/ itself.
+_RESULT_VIA_DRIVE = False
 
 # Colab idle-prunes free VM assignments with NO keep-alive ping. The colab-cli
 # spawns its own keep-alive daemon at `colab new`, but that daemon caches the
@@ -278,43 +309,163 @@ def colab(*args, timeout=300):
     return sh([sys.executable, COLAB_PY, *args], timeout=timeout)
 
 
-def poll_log(deadline, needle="[RESULT]"):
+def _age(ts):
+    """Seconds since ts, or -1 when unknown (never raises)."""
+    return int(time.time() - ts) if ts else -1
+
+
+def _parse_iso(ts):
+    """ISO-8601 (Drive) -> epoch seconds, or None."""
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def drive_run_activity(results_folder, run_id):
+    """Newest Drive artifact mtime (epoch) for THIS run's checkpoint folder.
+
+    This is the runner's SECOND, out-of-band liveness channel. The VM pushes
+    heartbeat.json every 10 steps + a step-N adapter every RUN_SAVE_STEPS into
+    checkpoints/<run_id>/, so a fresh mtime there proves the VM is alive even
+    when `colab logs` has gone dark. Returns None when the folder/files are not
+    reachable (treated as "no information", never as proof of death).
+    """
+    try:
+        drive = Drive(GDRIVE_PY, str(ADC_FILE))
+        parent = drive.ensure_folder(results_folder, "checkpoints")
+        if not parent:
+            return None
+        for folder in drive.list_files(parent):
+            if not isinstance(folder, dict):
+                continue
+            if folder.get("m") != Drive.FOLDER_MIME or folder.get("n") != run_id:
+                continue
+            newest = None
+            for f in drive.list_files(folder.get("id")):
+                if not isinstance(f, dict):
+                    continue
+                ts = _parse_iso(f.get("t"))
+                if ts and (newest is None or ts > newest):
+                    newest = ts
+            return newest
+    except Exception as e:
+        log(f"drive liveness probe failed: {str(e)[:150]}")
+    return None
+
+
+def drive_run_result(results_folder, run_id):
+    """Read the run's Drive result.json — the out-of-band success signal.
+
+    Returns (ok:bool, payload_dict) or None. Necessary because the VM log
+    channel dies at ~60 min while training continues; without this the runner
+    could never see [RESULT] again and every long run would end as a false
+    TIMEOUT even though the adapter was archived successfully.
+    """
+    try:
+        drive = Drive(GDRIVE_PY, str(ADC_FILE))
+        parent = drive.ensure_folder(results_folder, "checkpoints")
+        if not parent:
+            return None
+        for folder in drive.list_files(parent):
+            if not isinstance(folder, dict) or folder.get("m") != Drive.FOLDER_MIME:
+                continue
+            if folder.get("n") != run_id:
+                continue
+            for f in drive.list_files(folder.get("id")):
+                if not isinstance(f, dict) or f.get("n") != "result.json":
+                    continue
+                tmp = pathlib.Path("/tmp/drive_result.json")
+                drive.download(f.get("id"), str(tmp))
+                if tmp.exists() and tmp.stat().st_size > 0:
+                    data = json.loads(tmp.read_text())
+                    return bool(data.get("ok")), data
+            return None
+    except Exception as e:
+        log(f"drive result probe failed: {str(e)[:150]}")
+    return None
+
+
+def poll_log(deadline, needle="[RESULT]", results_folder=None, run_id=None):
+    """Poll the VM log until the run finishes, or decide the VM is dead.
+
+    Death is declared only when BOTH channels are stale for HEARTBEAT_STALL_S:
+      * the newest [alive] heartbeat read from the VM log, and
+      * the newest artifact mtime in this run's Drive checkpoint folder.
+    The log channel alone is NOT sufficient — `colab logs` starts failing with
+    rc=1 at ~60 min (token lifetime) while the VM keeps training, and the old
+    log-only rule killed a healthy VM every night.
+    """
     last_alive_step = -1
     last_alive_at = None
+    progress_at = None          # newest proof of life from either channel
+    log_dead_since = None       # when the log channel first went unreadable
     while time.time() < deadline:
-        # Re-mint the colab token before each poll: the startup token expires
-        # ~59 min in, after which `colab logs` fails with rc=1 even though the
-        # VM is alive — causing a FALSE heartbeat stall (verified live). If the
-        # refresh itself fails, don't count the poll toward a stall: the rc=1
-        # would be an AUTH failure, not proof the VM died.
         fresh = refresh_colab_token()
         rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
+        if rc != 0 and "auth-expired" in str(out or "") + str(err or ""):
+            # Login died mid-poll: force a fresh token and retry once right away
+            # instead of waiting a whole poll interval.
+            log("log poll auth-expired — forcing token refresh and retrying once")
+            refresh_colab_token(force=True)
+            rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
         if needle in out or "EXIT" in out or "NOT FOUND" in out:
             return out
-        # heartbeat stall detection: daily_finetune.py emits [alive] step=N every
-        # 10 steps. If we've seen a heartbeat but the newest one hasn't advanced
-        # for HEARTBEAT_STALL_MIN, the VM is dead (session recycled / OOM-killed)
-        # and the runner should recover the latest checkpoint and fail FAST
-        # instead of polling a corpse until the full timeout budget.
+        now = time.time()
+        if rc == 0:
+            log_dead_since = None
+        elif log_dead_since is None:
+            log_dead_since = now
+        # heartbeat channel
         import re as _re
         m = _re.findall(r"\[alive\] step=(\d+)", out)
         if m:
             cur = max(int(x) for x in m)
             if cur > last_alive_step:
                 last_alive_step = cur
-                last_alive_at = time.time()
-            elif last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
-                log(f"HEARTBEAT STALLED: newest [alive] step={cur} unchanged for {HEARTBEAT_STALL_S}s — VM likely dead")
-                return "HEARTBEAT_STALLED"
-        elif rc != 0 and fresh and last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
-            # log unreadable AND we had a heartbeat before AND the token was
-            # fresh (so rc=1 is NOT an auth failure) — treat as dead
-            log(f"HEARTBEAT STALLED: log unreadable (rc={rc}) and no new [alive] for {HEARTBEAT_STALL_S}s")
-            return "HEARTBEAT_STALLED"
+                last_alive_at = now
+                progress_at = now
+        # Drive channel — only probed while the log channel is dark (it costs a
+        # couple of gdrive.py subprocesses per call, no point on every poll)
+        drive_at = None
+        if log_dead_since is not None and results_folder and run_id:
+            drive_at = drive_run_activity(results_folder, run_id)
+            if drive_at and (progress_at is None or drive_at > progress_at):
+                progress_at = drive_at
+            if drive_at:
+                global _LAST_DRIVE_AT
+                _LAST_DRIVE_AT = max(_LAST_DRIVE_AT or 0, drive_at)
+            # completion signal on the Drive channel: the VM pushed result.json
+            res = drive_run_result(results_folder, run_id)
+            if res is not None:
+                ok, payload = res
+                global _RESULT_VIA_DRIVE
+                _RESULT_VIA_DRIVE = True
+                log(f"run finished — result.json on Drive: ok={ok} "
+                    f"steps={payload.get('steps')} loss={payload.get('loss')} "
+                    f"(log channel was dead, so [RESULT] came from Drive)")
+                return (f"[RESULT] ok={'true' if ok else 'false'} (via Drive result.json) "
+                        f"{json.dumps(payload)}")
+        # auth-expired or any rc!=0: surface stdout too — colab.py `die()` writes
+        # {"ok":false,"err":...} to STDOUT, so logging stderr alone hid the real
+        # cause for 8 straight nights.
         if rc != 0:
-            # transient colab flakiness or auth failure — keep polling
-            log(f"log poll rc={rc}: {err[-200:]}" + ("" if fresh else " (token refresh failed — not counted as stall)"))
-        time.sleep(90)
+            log(f"log poll rc={rc} (log channel dark {_age(log_dead_since)}s): "
+                f"out={out[-300:]!r} err={err[-200:]!r}"
+                + ("" if fresh else " (token refresh failed)"))
+        # stall verdict
+        if progress_at is not None and now - progress_at > HEARTBEAT_STALL_S:
+            log(f"HEARTBEAT STALLED: no progress on EITHER channel for "
+                f"{_age(progress_at)}s (log dead {_age(log_dead_since)}s, "
+                f"last [alive] step={last_alive_step}, drive_at={drive_at}) — VM dead")
+            return "HEARTBEAT_STALLED"
+        if progress_at is None and log_dead_since is not None \
+                and now - log_dead_since > HEARTBEAT_STALL_S:
+            # never saw a single heartbeat on any channel AND the log is dark
+            log(f"HEARTBEAT STALLED: no heartbeat ever seen on either channel "
+                f"and log unreadable for {_age(log_dead_since)}s")
+            return "HEARTBEAT_STALLED"
+        time.sleep(POLL_INTERVAL_S if log_dead_since is None else POLL_INTERVAL_DARK_S)
     return None
 
 
@@ -328,10 +479,33 @@ def training_succeeded(final_log):
     return "[RESULT] ok=true" in final_log or "[RESULT] ok=True" in final_log
 
 
-def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
+def recover_latest_checkpoint_to_adapter_in(folder_in, run_id, baseline_activity=None,
+                                            wait_s=None):
     """Pull the newest Drive checkpoint into the adapter_in continuity folder.
     Called on runner timeout / VM death so the next run resumes from the last
-    saved checkpoint instead of the pre-run adapter."""
+    saved checkpoint instead of the pre-run adapter.
+
+    GRACE WAIT (why): the VM keeps training for a while after the runner gives
+    up on a session — on 2026-09-10 the runner stopped the session at 19:08 and
+    the VM pushed step-100 at 19:16, but recovery had already copied the older
+    step-50 into adapter_in, so the next run resumed 50 steps BEHIND. When we
+    know the last Drive activity seen while polling (baseline_activity), wait up
+    to wait_s for a NEWER artifact before copying.
+    """
+    if wait_s is None:
+        wait_s = RECOVER_WAIT_S
+    if baseline_activity:
+        t0 = time.time()
+        while time.time() - t0 < wait_s:
+            act = drive_run_activity(os.environ.get("DRIVE_RESULTS", ""), run_id)
+            if act and act > baseline_activity + 5:
+                log(f"recovery: newer Drive artifact after {int(time.time()-t0)}s "
+                    f"(activity advanced) — using the newest checkpoint")
+                break
+            time.sleep(RECOVER_POLL_S)
+        else:
+            log(f"recovery: no newer Drive artifact within {wait_s}s — "
+                f"using the newest available checkpoint")
     try:
         drive = Drive(GDRIVE_PY, str(ADC_FILE))
         found = find_latest_checkpoint(drive, os.environ.get("DRIVE_RESULTS", ""), run_id)
@@ -511,14 +685,17 @@ sys.exit(r.returncode)
 
     # --- poll ---
     deadline = time.time() + TRAIN_TIMEOUT_S
-    log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s")
-    final = poll_log(deadline)
+    log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s "
+        f"(stall window {HEARTBEAT_STALL_S}s, both channels)")
+    final = poll_log(deadline, results_folder=folder_out, run_id=run_id)
     if final == "HEARTBEAT_STALLED":
-        # VM died mid-training (session recycled / OOM). Recover the newest
-        # checkpoint so the next run resumes from real progress, fail fast.
+        # Both liveness channels (VM log AND Drive checkpoints) went quiet for
+        # the stall window — the VM really is gone (session recycled / OOM).
+        # Recover the newest checkpoint (waiting briefly in case a late push
+        # lands) and fail fast.
         log("HEARTBEAT STALLED: VM appears dead — recovering latest checkpoint and stopping")
         _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit("VM heartbeat stalled (training died); latest Drive checkpoint recovered into adapter_in")
     if final is None:
@@ -529,7 +706,7 @@ sys.exit(r.returncode)
             # detached on the VM, and the Drive checkpoints keep flowing.
             log("UNLIMITED MODE: runner poll budget reached; training continues detached on the VM")
             log("leaving session RUNNING — checkpoints keep being pushed to Drive until VM recycle")
-            recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+            recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
             log("latest Drive checkpoint recovered into adapter_in (next run resumes from real progress)")
             log("DONE (unlimited mode — session NOT stopped)")
             print("\n[run_daily] SUCCESS — training continues detached; Drive checkpoints accumulating", flush=True)
@@ -538,7 +715,7 @@ sys.exit(r.returncode)
         # The VM pushes checkpoints to Drive as it trains — recover the newest
         # one so the next run resumes from real progress, not the pre-run adapter.
         _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
     log(f"training log tail:\n{final[-2000:]}")
@@ -547,7 +724,7 @@ sys.exit(r.returncode)
         # Recover whatever checkpoint the VM pushed before dying so tomorrow
         # resumes from real progress, then fail loudly — never report SUCCESS.
         _stop_keep_alive(keep_alive_stop)
-        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id, _LAST_DRIVE_AT)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit(f"training failed on the VM (no [RESULT] ok=true in log): {final[-800:]}")
 
@@ -555,16 +732,27 @@ sys.exit(r.returncode)
     outdir = pathlib.Path("out")
     outdir.mkdir(exist_ok=True)
     results = {}
-    for remote, local in [
-        ("/content/out/adapter_model.safetensors", "out/adapter_model.safetensors"),
-        ("/content/out/adapter_config.json", "out/adapter_config.json"),
-        ("/content/out/metrics.json", "out/metrics.json"),
-    ]:
-        rc, o, e = colab("download", "-s", SESSION, remote, local, timeout=300)
-        results[local] = rc == 0 and pathlib.Path(local).exists()
-        log(f"download {local}: rc={rc} exists={results[local]}")
-    if not results["out/adapter_model.safetensors"]:
-        log("WARNING: adapter download failed — VM already pushed it to Drive (adapter_in + archive)")
+    if _RESULT_VIA_DRIVE:
+        # The log/exec channel was dead for this whole phase — `colab download`
+        # rides the same dead channel, so don't burn 3 x 5 min timeouts. The VM
+        # already pushed adapter_in + results-<date>/ + checkpoints to Drive.
+        log("log channel was dead: skipping colab download — adapter is on Drive "
+            "(adapter_in + results-<date>/ + checkpoints)")
+        res = drive_run_result(folder_out, run_id)
+        payload = res[1] if res else {}
+        (outdir / "metrics.json").write_text(json.dumps(payload, indent=2))
+        log(f"wrote out/metrics.json from the Drive result.json ({payload})")
+    else:
+        for remote, local in [
+            ("/content/out/adapter_model.safetensors", "out/adapter_model.safetensors"),
+            ("/content/out/adapter_config.json", "out/adapter_config.json"),
+            ("/content/out/metrics.json", "out/metrics.json"),
+        ]:
+            rc, o, e = colab("download", "-s", SESSION, remote, local, timeout=300)
+            results[local] = rc == 0 and pathlib.Path(local).exists()
+            log(f"download {local}: rc={rc} exists={results[local]}")
+        if not results["out/adapter_model.safetensors"]:
+            log("WARNING: adapter download failed — VM already pushed it to Drive (adapter_in + archive)")
 
     # --- stop session (free tier: don't leave it idle) ---
     _stop_keep_alive(keep_alive_stop)
