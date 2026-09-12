@@ -27,8 +27,10 @@ machine and no API keys needed to run.
 - `run_daily.py` — GitHub Actions orchestrator. Mints Colab tokens, creates a
   T4 session, uploads the staged scripts (`daily_finetune.py`, `egtkg_build.py`,
   `pubmed_ingest.py`, vendored `gdrive.py`/`colab.py`) + the ADC, launches
-  training detached, polls with stall detection + its own keep-alive loop, and
-  recovers the newest Drive checkpoint on any failure.
+  training detached, then polls TWO liveness channels (the VM log heartbeats and
+  the run folder's Drive artifact mtimes), extends its deadline from the first
+  heartbeat, and on any non-success exit settles on Drive's `result.json` before
+  recovering the newest checkpoint.
 - `.github/workflows/daily-egtkg.yml` — cron 14:40 UTC (22:40 HKT) + dispatch.
 - `deploy_chat.py` — standalone: pull latest Drive adapter, load base in NF4 +
   LoRA, answer medical questions (single-file, runs on the T4).
@@ -47,7 +49,10 @@ machine and no API keys needed to run.
 3. **`N:days[edat]` NCBI indexing is unreliable** here. Use explicit date
    ranges (see pubmed_ingest).
 4. **Healthy VS green-log are different.** `[RESULT] ok=true` (printed after
-   verify + Drive push) is the only success signal. `EXIT …` alone is failure.
+   verify + Drive push) is the success signal, and the equivalent out-of-band
+   signal is `result.json` `{ok:true}` in the run folder on Drive — the runner
+   accepts either (the log channel is dead after ~60 min, so late runs only ever
+   surface via `result.json`). `EXIT …` alone is NOT success.
 5. **Relationship extraction is conservative and deterministic** (no 30B LLM
    like the paper's AutoSchemaKG). Entities are filtered for clause-swallow
    junk; rows are evidence-grounded, so a noisy head occasionally appears but
@@ -87,3 +92,31 @@ machine and no API keys needed to run.
   way).
 - Log BOTH stdout and stderr on a failed `colab` call: `colab.py die()` prints
   `{"ok":false,"err":...}` to STDOUT, so stderr-only logging hides the cause.
+  That fix paid off immediately: the log channel's real failure is
+  `{"err":"not-found"}` (colab-cli loses the session mapping), NOT an auth
+  expiry — so token re-minting was never the fix. `colab recover` is retried
+  twice when that error appears.
+- **The poll deadline must start at TRAINING start, not at exec_detach.** VM
+  setup (pip installs + PubMed ingest + model load) runs 29-49 min and does NOT
+  count toward the VM's own `--max-minutes`, so a `max_minutes + 25` budget can
+  expire while training is legitimately running: run 34624713317 timed out at
+  18:36:29 and the VM pushed `result.json` at 18:40:11 — 4 minutes late.
+  `poll_log(train_budget_s=...)` extends the deadline to
+  `first_heartbeat + (max_minutes + 20) min`.
+- **Settle before recovering.** Every stall/timeout/no-`[RESULT]` exit first
+  waits `RUN_RECOVER_WAIT_MINUTES` for `result.json`; `ok=true` means the run
+  COMPLETED (that file is written after verify + archive + adapter_in), so
+  report SUCCESS and leave adapter_in alone instead of overwriting it with a
+  mid-run checkpoint (the same run would otherwise lose 50+ steps).
+- **Replace single-instance Drive files in place.** Same-name uploads create NEW
+  files and Drive listings are eventually consistent, so delete-then-upload still
+  duplicates: `heartbeat.json` / `loss_curve.json` / the latest-adapter pointer /
+  the dated archive all use `upload_replace` (update the existing file id), with
+  a list+delete fallback. `results-<date>/` is that date's FINAL STATE — a smoke
+  run plus a real run on one day must not leave two 84 MB adapters side by side.
+- Heartbeat polling is cheap insurance: the VM's `heartbeat.json` lands every
+  10 steps (~3-4 min) while step checkpoints are ~20 min apart, so a stall
+  window can be both tight and safe. Watch the ARTIFACT STORE for live progress
+  when a GH step is still running — GitHub only publishes step logs on
+  completion.
+
