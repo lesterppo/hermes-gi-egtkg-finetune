@@ -245,6 +245,7 @@ def build_rows(store, rng):
         if not (art.get("abstract") or "").strip():
             continue
         src = source_node(art)
+        got_abstain = False   # at most one abstention row per article
         tps = extract_triples(art)
         # EGT-KG grounding: any QA we emit must be answerable from evidence
         # held in the reified store. We do that by making the assistant answer
@@ -279,15 +280,46 @@ def build_rows(store, rng):
             elif rel == "MARKER_OF":
                 templates = MRK_QA
             u, a = rng.choice(templates)
-            user_s = u.format(H=H, T=T)
+            # GROUND THE QUESTION: the relation question must carry the evidence
+            # span, otherwise the only way to satisfy the loss is to invent
+            # plausible evidence. Held-out A/B (2026-09-13) showed exactly that:
+            # kg rows scored grounded 1.29 vs the base model's 1.57, with the
+            # blinded judge reporting fabricated studies, PMIDs and disease
+            # context. With the span in the prompt these rows become extractive
+            # like the other two types (which score 5/5).
+            u = (f"Retrieved evidence from {src}: \"{KM}\"\n\n"
+                 f"Using only the retrieved evidence, " + u[0].lower() + u[1:])
             ans_s = a.format(H=H, T=T, KM=KM, S=src)
             rows.append(
                 {"messages": [
-                    {"role": "user", "content": user_s},
+                    {"role": "user", "content": u},
                     {"role": "assistant", "content": ans_s},
                 ], "kind": "kg", "rel": rel,
                  "e": KM}  # keep evidence for provenance/audit, not for training
             )
+            # ABSTENTION: the same relation question asked against UNRELATED
+            # evidence. Without these the model has no "decline" behaviour at all
+            # — the mix contained zero examples of an unanswerable question.
+            # Emitted once per article (not per triple) so coverage is reliable
+            # instead of a coin flip, and capped so extractive rows stay dominant.
+            if not got_abstain and len(store) > 1 and rng.random() < 0.85:
+                other = rng.choice(list(store.values()))
+                other_sents = sentences(other.get("abstract") or "")
+                if other_sents:
+                    alien = rng.choice(other_sents)
+                    hw = [w for w in re.findall(r"[A-Za-z]{4,}", H) if len(w) > 3]
+                    if not any(w.lower() in alien.lower() for w in hw):
+                        rows.append(
+                            {"messages": [
+                                {"role": "user",
+                                 "content": f"Retrieved evidence from {source_node(other)}: "
+                                            f"\"{alien}\"\n\nUsing only the retrieved evidence, "
+                                            f"how does {H} relate to {T}? Reply precisely."},
+                                {"role": "assistant",
+                                 "content": "Not answerable from the retrieved evidence."},
+                            ], "kind": "abstain"}
+                        )
+                        got_abstain = True
         # a factual extractive row per article quoted verbatim from evidence
         s0 = rng.choice(sentences(art["abstract"]))
         rows.append(
