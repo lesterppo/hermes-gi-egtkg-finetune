@@ -66,6 +66,14 @@ def run(cmd):
     return subprocess.run(cmd, shell=True, check=False)
 
 
+# Visible status of the DATA stage. Carried into metrics.json + result.json so a
+# silent ingest failure can never hide again: pubmed_ingest crashed for several
+# days (int() sort on the non-numeric reference-corpus keys) and the loop kept
+# training on a frozen corpus while every surface (GH job, result.json) stayed
+# green.
+INGEST_STATUS = {}
+
+
 def install_deps():
     """Idempotent install of the known-good training stack."""
     run(f"{sys.executable} -m pip uninstall -q -y torchao")
@@ -455,6 +463,46 @@ def push_archive(drive, results_folder, date, local_dir, metrics):
     print(f"[drive] archived to results-{date}", flush=True)
 
 
+def merge_stores(store_path, extra_path, label=""):
+    """Merge a jsonl file into the knowledge store BY KEY (dedupe), then rewrite.
+
+    Replaces the old `cat extra >> store` pattern, which appended the full
+    textbook/case corpus on EVERY run: the store grew ~5 MB/day of pure
+    duplicates while the real literature ingest was silently broken.
+    """
+    def key_of(rec):
+        for k in ("pmid", "id", "key"):
+            v = rec.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return None
+
+    store = {}
+    for path in (store_path, extra_path):
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                k = key_of(rec)
+                if k:
+                    store[k] = rec
+    if not store:
+        return 0
+    with open(store_path, "w") as fh:
+        for k in sorted(store, key=lambda x: (0, int(x), "") if x.isdigit() else (1, 0, x)):
+            fh.write(json.dumps(store[k]) + "\n")
+    print(f"[data] merged {label or os.path.basename(extra_path)} into store by key "
+          f"-> {len(store)} unique records", flush=True)
+    return len(store)
+
+
 def build_data(n_rows: int, seed: int, out_path: str) -> int:
     """Generate today's EGT-KG evidence-grounded medical QA training rows by
     running the two staged sibling scripts on the VM:
@@ -484,13 +532,27 @@ def build_data(n_rows: int, seed: int, out_path: str) -> int:
                 f"--store {store_path} --out /content/new.jsonl "
                 f"--max-oa {os.environ.get('MAX_OA','24')} "
                 f"--oa-probe 40")
+    INGEST_STATUS["pubmed_rc"] = r_ing.returncode
     print(f"[data] ingest rc={r_ing.returncode}", flush=True)
+    if r_ing.returncode != 0:
+        # This used to be a silent stall: pubmed_ingest crashed (int() sort on
+        # the non-numeric reference-corpus keys) and the run happily trained on
+        # a FROZEN corpus for days (row count pinned at ~1490). Fail loudly and
+        # carry the flag into metrics.json / result.json so it is visible after
+        # the log channel dies.
+        INGEST_STATUS["pubmed_ok"] = False
+        print("[data] !!! PUBMED INGEST FAILED — no new literature this run; "
+              "training would proceed on the frozen store. See ingest traceback above.",
+              flush=True)
+    else:
+        INGEST_STATUS["pubmed_ok"] = True
     time.sleep(1)
 
     # Reference/textbook corpus (StatPearls 171 chapters + NIDDK 56 + WGO 26).
     # Stable knowledge — refresh only on the 1st of the month (cheap: ~250
-    # pages, ~10 min) or when missing locally. Mixed into the same store so
-    # egtkg_build sees literature + reference knowledge together.
+    # pages, ~10 min) or when missing locally. Merged into the store BY KEY
+    # (not `cat >>`): appending every run duplicated several MB of textbook text
+    # into the store each day.
     ref_path = "/content/ref_store.jsonl"
     need_ref = (not os.path.exists(ref_path)) or time.strftime("%d") == "01"
     if need_ref and os.path.exists("/content/textbook_ingest.py"):
@@ -499,7 +561,7 @@ def build_data(n_rows: int, seed: int, out_path: str) -> int:
                     f"--out {ref_path} --sources statpearls,niddk,wgo")
         print(f"[data] textbook rc={r_ref.returncode}", flush=True)
     if os.path.exists(ref_path):
-        run(f"cat {ref_path} >> {store_path}")
+        merge_stores(store_path, ref_path, label="textbook")
 
     # Open-access case reports (CC-licensed PMC): clinical-reasoning chains
     # (presentation -> workup -> diagnosis -> management) that abstracts
@@ -509,7 +571,7 @@ def build_data(n_rows: int, seed: int, out_path: str) -> int:
                    f"--store /content/cr_store.jsonl --max 40")
         print(f"[data] case reports rc={r_cr.returncode}", flush=True)
         if os.path.exists("/content/cr_store.jsonl"):
-            run(f"cat /content/cr_store.jsonl >> {store_path}")
+            merge_stores(store_path, "/content/cr_store.jsonl", label="case-reports")
     time.sleep(1)
 
     cap = max(200, n_rows)
@@ -901,6 +963,13 @@ def main():
     metrics = train(model, tok, "/content/train_egtkg.jsonl", args.out,
                     args.save_steps, args.max_minutes, args.epochs, drive, run_folder)
     ok = verify_adapter(args.out)
+    # attach the data-stage status and rewrite metrics.json so the archive and
+    # any downstream reader can see whether fresh literature actually landed
+    metrics["ingest"] = dict(INGEST_STATUS)
+    try:
+        pathlib.Path(args.out, "metrics.json").write_text(json.dumps(metrics, indent=2))
+    except Exception as e:
+        print(f"[data] could not rewrite metrics.json with ingest status: {e}", flush=True)
 
     # --- Drive continuity: archive + update the 'latest adapter' pointer ---
     if drive:
@@ -922,6 +991,7 @@ def main():
                 "steps": metrics.get("train_steps"),
                 "loss": metrics.get("train_loss"),
                 "partial": metrics.get("partial"),
+                "ingest_ok": INGEST_STATUS.get("pubmed_ok"),
             }
             rp = pathlib.Path(args.out) / "result.json"
             rp.write_text(json.dumps(res))

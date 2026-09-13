@@ -183,6 +183,30 @@ def epmc_oa_fulltext(article):
         return ""
 
 
+def _sort_key(k):
+    """Sort PubMed keys numerically, non-PubMed keys (textbook 'SP_', case 'CR_')
+    after them. A bare int(k) here crashed every daily ingest once the reference
+    corpus landed in the store (ValueError: invalid literal for int() ... 'SP_4405244')
+    — the loop then trained on a FROZEN corpus while every surface stayed green.
+    """
+    s = str(k)
+    return (0, int(s), "") if s.isdigit() else (1, 0, s)
+
+
+def write_store(store, path, max_pub=MAX_STORE):
+    """Write the store: cap the PUBMED portion (oldest numeric pmid dropped),
+    keep all non-PubMed reference entries, sorted deterministically."""
+    pub_keys = [k for k in store if str(k).isdigit()]
+    if max_pub and len(pub_keys) > max_pub:
+        keep = set(sorted(pub_keys, key=lambda x: int(x))[-max_pub:])
+        store = {k: v for k, v in store.items()
+                 if not str(k).isdigit() or k in keep}
+    pathlib.Path(path).write_text(
+        "\n".join(json.dumps(store[k]) for k in sorted(store.keys(), key=_sort_key))
+    )
+    return store
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=2, help="ingest window in days (edat)")
@@ -295,14 +319,9 @@ def main():
     for a in new:
         store[a["pmid"]] = a
 
-    # cap store size (drop oldest by pmid order == oldest numeric)
-    if len(store) > MAX_STORE:
-        keep = sorted(store.keys(), key=lambda x: int(x))[-MAX_STORE:]
-        store = {k: store[k] for k in keep}
-
-    pathlib.Path(args.store).write_text(
-        "\n".join(json.dumps(store[k]) for k in sorted(store.keys(), key=lambda x: int(x)))
-    )
+    # Store keys are NOT all numeric (textbook 'SP_...', case-report 'CR_...'):
+    # see write_store()/_sort_key() for the crash this used to cause.
+    store = write_store(store, args.store)
     pathlib.Path(args.out).write_text("\n".join(json.dumps(a) for a in new))
 
     stats = {
