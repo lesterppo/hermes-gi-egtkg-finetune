@@ -10,7 +10,7 @@ NF4 QLoRA and merges the LoRA, then answers medical questions.
 
 Usage (Colab VM, GPU runtime):
     python deploy_chat.py --adc /content/gdrive_adc.json \
-        --adapter-parent 1BsmOdWKGLdXPt0aS6euB7F_yt9XAC0uO
+        --adapter-parent <your adapter_in folder id>
     # then type questions; answer model uses no retrieval here (parametric).
     # For grounded/retrieval QA, run it through the EGT-KG runner instead.
 

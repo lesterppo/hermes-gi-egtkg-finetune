@@ -14,7 +14,7 @@ format) as well as by a human/LLM judge.
 
 Usage (on the VM):
     python3 eval_ab.py --rows /content/eval_rows.jsonl --out /content/ab_results.jsonl \
-        --adapter-parent 1BsmOdWKGLdXPt0aS6euB7F_yt9XAC0uO --adc /content/gdrive_adc.json
+        --adapter-parent <your adapter_in folder id> --adc /content/gdrive_adc.json
 """
 import argparse
 import json
