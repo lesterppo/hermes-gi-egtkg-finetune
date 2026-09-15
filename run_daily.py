@@ -82,6 +82,28 @@ def train_timeout_s():
 
 TRAIN_TIMEOUT_S = train_timeout_s()
 
+# WALL BUDGET — the VM's own clock, measured from SESSION CREATION.
+#
+# Google recycles free-tier T4 sessions without warning and the VM goes
+# unreachable the moment it happens (its keep-alive endpoint starts returning
+# HTTP 404). Observed: 2026-09-13 and 2026-09-14 both died at ~2h20m after
+# creation (17:38:54→20:00:19 and 19:36:01→21:56:13), while 2026-09-11/12
+# survived 3h+; the healthy nights happened to finish their epoch before the
+# recycle, the two that did not were killed mid-epoch, and because the VM never
+# reached its final save/archive the runner could only salvage the last
+# periodic checkpoint and had to report FAILURE.
+#
+# So the VM is told an ABSOLUTE deadline (session create + RUN_WALL_MINUTES) and
+# stops training there — it then still has minutes to verify, archive and push
+# `result.json {ok:true, partial:true}`, which the runner accepts as SUCCESS.
+# RUN_WALL_MINUTES must stay below the observed ~140 min recycle: 120 leaves
+# ~20 min of finalize margin and still fits ~80 min of training after the
+# ~35-40 min setup (ingest + install + model load).
+WALL_MINUTES = int(float(os.environ.get("RUN_WALL_MINUTES", "120") or 0))
+
+# Extra slack after the wall for the finalize pushes before the runner gives up.
+WALL_FINALIZE_SLACK_MIN = 25
+
 # Stall detection: a run is only declared DEAD when BOTH liveness channels go
 # quiet for this long — the VM log ([alive] heartbeats) AND Drive (the VM pushes
 # heartbeat.json every 10 steps plus a step-N checkpoint every RUN_SAVE_STEPS).
@@ -731,6 +753,13 @@ def main():
             break
     if rc != 0:
         raise SystemExit(f"failed to create T4 session: {str(out)[-500:] or str(err)[-500:]}")
+    # The session's clock starts here — this is the reference point for the
+    # absolute deadline handed to the VM (see WALL_MINUTES).
+    session_created_at = time.time()
+    wall_deadline_epoch = int(session_created_at + WALL_MINUTES * 60) if WALL_MINUTES > 0 else 0
+    if wall_deadline_epoch:
+        log(f"session wall budget {WALL_MINUTES} min — VM will stop and finalize at "
+            f"{datetime.datetime.fromtimestamp(wall_deadline_epoch, datetime.timezone.utc).isoformat()}")
     # Colab idle-prunes free VMs whose keep-alive dies (~60 min). The colab-cli's
     # own daemon caches the startup token (expires ~59 min) and dies — we run our
     # own ping loop for the whole poll window instead.
@@ -767,6 +796,7 @@ cmd = [sys.executable, '/content/daily_finetune.py',
        '--run-id', '{run_id}',
        '--save-steps', '{save_steps}',
        '--max-minutes', '{max_minutes}',
+       '--deadline-epoch', '{wall_deadline_epoch}',
        '--epochs', '{epochs}',
        '--out', '/content/out']
 print('LAUNCH ' + ' '.join(cmd), flush=True)
@@ -783,14 +813,25 @@ sys.exit(r.returncode)
         raise SystemExit(f"exec_detach failed (session stopped): {out[-400:] or err[-400:]}")
 
     # --- poll ---
-    deadline = time.time() + TRAIN_TIMEOUT_S
+    # The poll budget is anchored to the VM's ABSOLUTE wall (session create +
+    # RUN_WALL_MINUTES + finalize slack), not to max_minutes: the VM now stops at
+    # the wall, so waiting max_minutes + 20 min after training starts would keep
+    # the runner hanging long after the VM death we are trying to stay ahead of.
+    if wall_deadline_epoch:
+        deadline = wall_deadline_epoch + WALL_FINALIZE_SLACK_MIN * 60
+    else:
+        deadline = time.time() + TRAIN_TIMEOUT_S
     max_minutes = int(float(max_minutes)) if str(max_minutes).strip() else 100
-    # training budget handed to poll_log for the adaptive deadline: the VM's own
-    # --max-minutes plus slack for the final save + archive + adapter_in pushes
-    train_budget_s = (max_minutes + 20) * 60 if max_minutes > 0 else 240 * 60
-    log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s "
-        f"(stall window {HEARTBEAT_STALL_S}s on BOTH channels; deadline extends to "
-        f"{train_budget_s}s after training starts)")
+    # training budget handed to poll_log for the adaptive deadline: never past
+    # the same absolute wall (it only extends the deadline for slow setups).
+    if wall_deadline_epoch:
+        train_budget_s = max(600, deadline - time.time())
+    else:
+        train_budget_s = (max_minutes + 20) * 60 if max_minutes > 0 else 240 * 60
+    log(f"polling /content/train.log until "
+        f"{datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc).isoformat()} "
+        f"(stall window {HEARTBEAT_STALL_S}s on BOTH channels; wall {WALL_MINUTES} min "
+        f"+ {WALL_FINALIZE_SLACK_MIN} min finalize slack)")
     final = poll_log(deadline, results_folder=folder_out, run_id=run_id,
                      train_budget_s=train_budget_s)
     if final == "HEARTBEAT_STALLED":

@@ -641,7 +641,7 @@ def load_model_and_adapter(base: str, adapter_path: str):
 
 
 def train(model, tok, data_path: str, out_dir: str, save_steps: int,
-          max_minutes: int, epochs: int, drive, run_folder):
+          max_minutes: int, epochs: int, drive, run_folder, deadline_epoch: float = 0.0):
     from trl import SFTConfig, SFTTrainer
     from datasets import load_dataset
     from transformers import TrainerCallback
@@ -677,17 +677,40 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                     print(f"[drive] loss_curve.json pushed at step {step}", flush=True)
 
     class TimeBudgetCallback(TrainerCallback):
-        def __init__(self, budget_s):
+        """Stop training on EITHER of two clocks.
+
+        * ``budget_s`` — minutes of TRAINING (legacy --max-minutes semantics).
+        * ``deadline_epoch`` — an ABSOLUTE wall-clock instant, measured from the
+          Colab SESSION's creation (the runner knows it, the VM does not).
+          Free-tier sessions get recycled by Google without warning (observed
+          twice at ~2h20m after creation, sometimes surviving 3h30m), and a
+          recycle mid-epoch kills the VM before the final save + archive, so
+          the runner reports FAILURE and the night's steps are only salvaged
+          from the last periodic checkpoint. Stopping on the absolute deadline
+          makes the run finalize (save + verify + archive + adapter_in +
+          result.json ``ok=true, partial=true``) while the VM is still alive.
+        """
+
+        def __init__(self, budget_s, deadline_epoch=0.0):
             self.budget_s = budget_s
+            self.deadline_epoch = deadline_epoch or 0.0
             self.start = time.time()
             self.timed_out = False
+            self.stop_reason = None
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
-            if self.budget_s and time.time() - self.start > self.budget_s:
+            if not self.timed_out and self.budget_s and time.time() - self.start > self.budget_s:
                 control.should_training_stop = True
-                if not self.timed_out:
-                    self.timed_out = True
-                    print(f"[train] time budget ({self.budget_s}s) reached at step {state.global_step} — stopping", flush=True)
+                self.timed_out = True
+                self.stop_reason = "budget"
+                print(f"[train] time budget ({self.budget_s}s) reached at step {state.global_step} — stopping", flush=True)
+            elif not self.timed_out and self.deadline_epoch and time.time() > self.deadline_epoch:
+                control.should_training_stop = True
+                self.timed_out = True
+                self.stop_reason = "session-deadline"
+                print(f"[train] SESSION DEADLINE reached at step {state.global_step} "
+                      f"(deadline was {time.strftime('%H:%M:%S', time.gmtime(self.deadline_epoch))}Z) — "
+                      f"stopping to finalize before the VM is recycled", flush=True)
 
     class LossCurveCallback(TrainerCallback):
         """Record every logged (step, loss) and persist loss_curve.json after
@@ -753,7 +776,16 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                 except Exception as e:
                     print(f"[drive] heartbeat push failed: {str(e)[:150]}", flush=True)
 
-    budget = TimeBudgetCallback(max_minutes * 60 if max_minutes and max_minutes > 0 else 0)
+    budget = TimeBudgetCallback(max_minutes * 60 if max_minutes and max_minutes > 0 else 0,
+                                deadline_epoch)
+    if deadline_epoch:
+        left_min = (deadline_epoch - time.time()) / 60
+        print(f"[train] session wall: {left_min:.1f} min of training left "
+              f"(deadline {time.strftime('%H:%M:%S', time.gmtime(deadline_epoch))}Z)", flush=True)
+        if left_min < 10:
+            print("[train] WARNING: less than 10 min of wall left at training start — "
+                  "setup (install + ingest + model load) ate the session budget; this run "
+                  "will bank few steps. Raise RUN_WALL_MINUTES or reduce --ingest-days.", flush=True)
     curve_cb = LossCurveCallback(out_dir)
     callbacks = [budget, curve_cb,
                  HeartbeatCallback(every=10, drive=drive, run_folder=run_folder, out_dir=out_dir)]
@@ -819,6 +851,7 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
         "train_samples": len(ds),
         "train_steps": steps,
         "partial": partial,
+        "stop_reason": budget.stop_reason or "epoch-complete",
         "train_loss": round(last_loss, 4) if last_loss is not None else None,
         "loss_curve": curve,
     }
@@ -918,6 +951,9 @@ def main():
     ap.add_argument("--save-steps", type=int, default=100)
     ap.add_argument("--max-minutes", type=int, default=100,
                     help="stop training after N minutes and save a final checkpoint (0 = unlimited)")
+    ap.add_argument("--deadline-epoch", type=float, default=0.0,
+                    help="absolute wall-clock epoch to STOP training and finalize before the "
+                         "Colab session is recycled (runner passes session_create + wall budget; 0 = none)")
     ap.add_argument("--epochs", type=int, default=1,
                     help="epochs per run; >1 keeps training until the VM is recycled (12h window)")
     args = ap.parse_args()
@@ -961,7 +997,8 @@ def main():
     build_data(args.rows, args.seed, "/content/train_egtkg.jsonl")
     model, tok = load_model_and_adapter(args.base, args.adapter)
     metrics = train(model, tok, "/content/train_egtkg.jsonl", args.out,
-                    args.save_steps, args.max_minutes, args.epochs, drive, run_folder)
+                    args.save_steps, args.max_minutes, args.epochs, drive, run_folder,
+                    args.deadline_epoch)
     ok = verify_adapter(args.out)
     # attach the data-stage status and rewrite metrics.json so the archive and
     # any downstream reader can see whether fresh literature actually landed

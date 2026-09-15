@@ -63,6 +63,9 @@ heavy — the ML stack installs on the Colab VM each run.
 - `rows` — evidence QA rows to train on (smoke **300**, daily **3000**).
 - `ingest_days` — how far back to pull fresh literature (default 20).
 - `max_minutes` — train budget (0 = until the ~2 h / ~12 h Colab recycle).
+- `wall_minutes` — ABSOLUTE session wall (from session creation, default 120):
+  the VM stops and finalizes there (`partial:true`, `stop_reason` in metrics),
+  so a night can never be lost to a silent Colab recycle.
 - `save_steps` — Drive checkpoint cadence.
 
 ## Why this design (lessons from the soup-daily-finetune pipeline)

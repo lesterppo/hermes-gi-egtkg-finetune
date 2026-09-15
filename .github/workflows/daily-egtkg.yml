@@ -18,6 +18,10 @@ on:
         description: "Stop training after N minutes (0=unlimited); 240 = full daily epoch"
         required: false
         default: "240"
+      wall_minutes:
+        description: "ABSOLUTE session wall (from session creation) after which the VM stops and finalizes"
+        required: false
+        default: "120"
       ingest_days:
         description: "how many days back to pull fresh GI/hepatology evidence"
         required: false
@@ -71,6 +75,7 @@ jobs:
           RUN_ROWS: ${{ github.event.inputs.rows || '3000' }}
           RUN_SAVE_STEPS: ${{ github.event.inputs.save_steps || '50' }}
           RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '240' }}
+          RUN_WALL_MINUTES: ${{ github.event.inputs.wall_minutes || '120' }}
           INGEST_DAYS: ${{ github.event.inputs.ingest_days || '20' }}
         run: python run_daily.py
 
