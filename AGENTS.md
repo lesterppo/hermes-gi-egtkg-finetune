@@ -69,6 +69,44 @@ machine and no API keys needed to run.
 - Heartbeat stall + runner keep-alive, in-process Drive uploads, model-only
   checkpoints, bf16 not fp16, jupyter-kernel-client compat patch, unique
   run-ids, pre-clean orphaned assignments, gpu-unavailable retries.
+- **The VM's life is NOT ours to control — budget against a WALL, not the
+  epoch.** Free-tier sessions are recycled without warning and the assignment
+  404s at the keep-alive endpoint the instant it happens. Measured: 2026-09-13
+  created 17:38:54, first 404 20:00:19; 2026-09-14 19:36:01 → 21:56:13 — both
+  **~2h20m after creation**, while 09-11/12 lived 3h+. Both of those nights were
+  killed mid-epoch, so the VM never reached save + archive + `result.json`, the
+  runner could only salvage the newest periodic checkpoint, and the night was
+  reported as FAILURE (three failed nights; the A/B row-mix fix `8c0d2ca` was
+  never once exercised in a completed run). Fix: `run_daily` stamps
+  `RUN_WALL_MINUTES` (default 120) from **session creation** and passes the
+  absolute epoch to the VM as `--deadline-epoch`; `TimeBudgetCallback` stops
+  there (`stop_reason: session-deadline`, `partial: true`) and the run still
+  finalizes — save, verify, archive, `adapter_in`, `result.json {ok:true}` — so
+  a wall hit is a SUCCESS with the night's steps banked. The runner's poll
+  deadline is anchored to the same wall (+ `WALL_FINALIZE_SLACK_MIN`), no longer
+  `max_minutes + 20` past a VM that is already gone. Consequence to accept: an
+  epoch longer than the wall is finished incrementally over several nights —
+  that is what "continuous daily fine-tune" means. `metrics.json` carries
+  `stop_reason` (`epoch-complete` | `budget` | `session-deadline`).
+- **`gpu-unavailable` is per-account, not global.** When all four `colab new`
+  retries return it, the account behind `COLAB_REFRESH_TOKEN` has burned its
+  free-tier GPU quota for the day (~3-4 sessions) — verify by creating a T4
+  session locally on a different account before blaming Colab. Rotate the
+  secret (see the colab-cli rotation notes) or wait for the daily reset; the
+  runtime account may differ from the Drive account (`GDRIVE_ADC`) safely.
+- **The A/B eval is the gate — and it is now automated, but the JUDGE is not.**
+  Dispatch `eval-ab.yml` (`run_eval.py`): free Colab T4 → pull the training
+  store → fresh ingest → held-out rows (`eval_build.py`) → generate every answer
+  twice, adapter ON vs `model.disable_adapter()` OFF → publish
+  `ab_results.jsonl` + `eval_rows.jsonl` + `eval_done.json` to
+  `results/ab-eval-<date>/` → the runner scores mechanically (`ab_score.py`) and
+  uploads `out/`. `judge_ab.py` (blinded Gemini Pro) stays LOCAL: Gemini web auth
+  is refused from runner IPs (consent page), so run it against the downloaded
+  `ab_results.jsonl` from a machine with live browser cookies. Do not freeze or
+  deploy an adapter without re-running the gate against the CURRENT `adapter_in`:
+  the 2026-09-13 numbers (extractive rows 5/5 grounded, 7/7 preferred; `kg` rows
+  actively harmful, base scored higher) were measured on `results-2026-09-12`,
+  which is NOT what `adapter_in` holds now.
 - **Liveness must not depend on the VM log alone.** `colab logs`/`colab exec`
   starts failing with rc=1 about 60 min into a session (colab-cli access-token
   lifetime; re-minting token.json does not revive it) while training keeps

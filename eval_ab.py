@@ -122,6 +122,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-new-tokens", type=int, default=192)
     ap.add_argument("--skip-install", action="store_true")
+    ap.add_argument("--deadline-epoch", type=float, default=0.0,
+                    help="absolute wall-clock epoch (from SESSION creation) after which to stop "
+                         "generating and finalize the partial result set (0 = no wall)")
     args = ap.parse_args()
 
     if not args.skip_install:
@@ -148,8 +151,17 @@ def main():
     print("[eval] model + adapter loaded", flush=True)
 
     done = 0
+    wall_hit = False
     with open(args.out, "w") as fh:
         for row in rows:
+            # Free-tier VMs are recycled without warning; stopping on the wall
+            # keeps the comparisons already generated (scoring only needs the
+            # rows written so far) instead of losing the whole session.
+            if args.deadline_epoch and time.time() > args.deadline_epoch:
+                wall_hit = True
+                print(f"[eval] SESSION DEADLINE reached after {done}/{len(rows)} rows — "
+                      f"finalizing the partial set", flush=True)
+                break
             msgs = row["messages"]
             user_only = [m for m in msgs if m.get("role") != "assistant"] or msgs
             adapter_out, t_a = generate(model, tok, user_only, args.max_new_tokens)
@@ -164,7 +176,8 @@ def main():
             done += 1
             if done % 5 == 0:
                 print(f"[eval] {done}/{len(rows)} rows done", flush=True)
-    print(f"[eval] wrote {done} comparisons -> {args.out}", flush=True)
+    print(f"[eval] wrote {done} comparisons -> {args.out}"
+          f"{' (partial: session wall)' if wall_hit else ''}", flush=True)
     return 0
 
 

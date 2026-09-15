@@ -58,6 +58,26 @@ keyless public endpoints, Colab is the free tier, Drive keeps state.
 No model weights or secret live in this repo; the runner installs nothing
 heavy — the ML stack installs on the Colab VM each run.
 
+## Evaluation gate (run before freezing or deploying an adapter)
+
+The A/B gate answers "is this adapter actually better than the base model on
+held-out literature?" — dispatch the `A/B eval gate` workflow:
+
+```
+Colab VM : pull training store -> fresh PubMed ingest -> keep only PMIDs ABSENT
+           from the training store -> build QA rows -> generate every answer
+           TWICE (adapter ON / model.disable_adapter() OFF, greedy, same prompt)
+Runner   : download ab_results.jsonl -> ab_score.py (verbatim-evidence recall,
+           provenance, trained shape, out-of-evidence words, truncation)
+Drive    : results/ab-eval-<date>/{ab_results,eval_rows,eval_done}.json
+```
+
+The blinded Gemini Pro pass (`judge_ab.py`) is NOT in CI: Gemini web auth is
+refused from runner IPs, so run it locally against the downloaded
+`ab_results.jsonl`. Freeze rule (2026-09-13 baseline in
+`docs/AB_EVAL_2026-09-13.md`): extractive rows (`evidence`/`fact`) stay 5/5
+grounded AND the relation/abstention behaviour is removed or >= 4/5 grounded.
+
 ## Tuning knobs (workflow_dispatch)
 
 - `rows` — evidence QA rows to train on (smoke **300**, daily **3000**).

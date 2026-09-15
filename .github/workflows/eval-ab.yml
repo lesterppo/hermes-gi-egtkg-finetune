@@ -1,0 +1,104 @@
+name: A/B eval gate (adapter vs base, held-out)
+
+# The gate that decides whether the adapter may be frozen / deployed.
+# Dispatch-only on purpose: this burns a free Colab T4 session and should be run
+# when a decision is due, not nightly.
+#
+# What it does (see run_eval.py / eval_run.py):
+#   1. free Colab T4 session (same quota-retry ladder + keep-alive + wall budget
+#      as the daily run);
+#   2. on the VM: pull the training knowledge_store.jsonl -> fresh PubMed ingest
+#      -> keep only PMIDs ABSENT from the training store -> build QA rows from
+#      that held-out slice;
+#   3. generate every answer twice (adapter ON vs adapter OFF, greedy, same
+#      prompt) and publish ab_results.jsonl + eval_rows.jsonl to
+#      Drive results/ab-eval-<date>/;
+#   4. on the runner: ab_score.py (mechanical scoring) -> artifacts.
+#
+# NOT automated here: judge_ab.py (blinded Gemini Pro). Gemini web auth needs a
+# browser cookie and runner IPs get the consent page, so run it locally:
+#   python3 judge_ab.py --scored out/scored.jsonl --out out/judge.jsonl \
+#       --n 14 --per-kind kg=7,evidence=4,fact=3
+#
+# Freeze rule (from docs/AB_EVAL_2026-09-13.md): extractive row kinds
+# (evidence/fact) must stay 5/5 grounded AND the relation/abstention behaviour
+# must be removed or >= 4/5 grounded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "held-out rows to compare (80 = the 2026-09-13 baseline run)"
+        required: false
+        default: "80"
+      days:
+        description: "fresh PubMed ingest window that supplies the held-out pool"
+        required: false
+        default: "60"
+      max_new_tokens:
+        description: "greedy decode budget per answer"
+        required: false
+        default: "192"
+      wall_minutes:
+        description: "ABSOLUTE session wall; eval stops generating and finalizes a partial set"
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gi-egtkg-eval
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runner deps
+        run: pip install -r requirements.txt
+
+      - name: Patch colab-cli 0.6.0 jupyter-kernel-client compat
+        run: |
+          python - <<'EOF'
+          import pathlib, colab_cli.runtime
+          p = pathlib.Path(colab_cli.runtime.__file__)
+          s = p.read_text()
+          f = s.replace("jupyter_kernel_client.KernelClient(", "jupyter_kernel_client.JupyterKernelClient(")
+          if f != s:
+              p.write_text(f); print("patched KernelClient -> JupyterKernelClient")
+          else:
+              print("no patch needed")
+          EOF
+
+      - name: Run held-out A/B evaluation
+        env:
+          COLAB_CLIENT_ID: ${{ secrets.COLAB_CLIENT_ID }}
+          COLAB_CLIENT_SECRET: ${{ secrets.COLAB_CLIENT_SECRET }}
+          COLAB_REFRESH_TOKEN: ${{ secrets.COLAB_REFRESH_TOKEN }}
+          GDRIVE_ADC: ${{ secrets.GDRIVE_ADC }}
+          DRIVE_ADAPTER_IN: ${{ secrets.DRIVE_ADAPTER_IN }}
+          DRIVE_RESULTS: ${{ secrets.DRIVE_RESULTS }}
+          EVAL_LIMIT: ${{ github.event.inputs.limit || '80' }}
+          EVAL_DAYS: ${{ github.event.inputs.days || '60' }}
+          EVAL_MAX_NEW_TOKENS: ${{ github.event.inputs.max_new_tokens || '192' }}
+          EVAL_WALL_MINUTES: ${{ github.event.inputs.wall_minutes || '100' }}
+        run: python run_eval.py
+
+      - name: Upload artifacts (comparisons + scored results + summary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egtkg-ab-eval
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 30
+          compression-level: 6
