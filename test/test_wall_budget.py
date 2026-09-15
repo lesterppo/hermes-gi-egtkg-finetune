@@ -121,6 +121,12 @@ def test_workflow_exposes_the_knob():
     check("workflow input wall_minutes", "wall_minutes:" in wf)
     check("workflow env RUN_WALL_MINUTES",
           "RUN_WALL_MINUTES: ${{ github.event.inputs.wall_minutes || '120' }}" in wf)
+    # a schedule event carries no inputs: the || fallback must exist for BOTH the
+    # workflow env and the input default, or cron runs get an empty wall
+    check("workflow input default 120", re.search(r"wall_minutes:.*?default: \"120\"", wf, re.S) is not None)
+    check("runner logs the wall for diagnosis", "session wall budget" in (REPO / "run_daily.py").read_text())
+    check("VM logs remaining wall at training start",
+          "min of training left" in (REPO / "daily_finetune.py").read_text())
 
 
 if __name__ == "__main__":
