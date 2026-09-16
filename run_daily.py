@@ -240,11 +240,16 @@ def log(msg):
 
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# gdrive.py `about` reports the Drive account's display name — an identifier we
+# do not publish on a public repo's logs.
+_ACCT_NAME_RE = re.compile(r'"name"\s*:\s*"[^"]*"')
 
 
 def _redact(msg):
     try:
-        return _EMAIL_RE.sub("<redacted-email>", str(msg))
+        s = str(msg)
+        s = _EMAIL_RE.sub("<redacted-email>", s)
+        return _ACCT_NAME_RE.sub('"name":"<redacted>"', s)
     except Exception:
         return str(msg)
 

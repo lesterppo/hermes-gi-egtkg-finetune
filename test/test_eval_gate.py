@@ -87,6 +87,25 @@ def test_vm_orchestrator_publishes_markers():
     check("adapter evaluated is the one in adapter_in (--adapter-folder)", "--adapter-folder" in src)
 
 
+def test_failure_reporting_is_diagnosable():
+    """A failed eval must surface its REASON, not 'artifact missing'."""
+    runner = _read("run_eval.py")
+    vm = _read("eval_run.py")
+    ab = _read("eval_ab.py")
+    daily = _read("run_daily.py")
+    check("runner parses ok=false from [EVALRESULT]",
+          'r"\\[EVALRESULT\\]\\s*ok=(true|false)' in runner)
+    check("runner always resolves the Drive marker for the structured reason",
+          'if "eval_done.json" in files:' in runner and "eval failed on the VM" in runner)
+    check("VM tees the child output to a file", "def run_tee(" in vm and '"eval_ab.log"' in vm)
+    check("VM ships that log with the marker", "extra_files=[ab_log]" in vm)
+    check("VM ships that log on success too", '(os.path.join(args.out_dir, "eval_ab.log"), "eval_ab.log")' in vm)
+    check("adapter fetch tries the in-process Drive API first",
+          "from daily_finetune import Drive" in ab and "adapter fetched via Drive API" in ab)
+    check("adapter fetch reports every exhausted path", "all three fetch paths exhausted" in ab)
+    check("logs redact the Drive account display name", "_ACCT_NAME_RE" in daily)
+
+
 def test_eval_ab_wall_behaviour():
     src = _read("eval_ab.py")
     check("--deadline-epoch arg", '"--deadline-epoch"' in src)
@@ -101,6 +120,7 @@ if __name__ == "__main__":
     test_workflow_is_dispatch_only_and_runs_the_runner()
     test_runner_wall_and_session_discipline()
     test_vm_orchestrator_publishes_markers()
+    test_failure_reporting_is_diagnosable()
     test_eval_ab_wall_behaviour()
     print()
     print(f"{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")

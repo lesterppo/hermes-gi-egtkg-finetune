@@ -51,6 +51,34 @@ def fetch_adapter(folder_id, dest, adc=None, gdrive_py="/content/gdrive.py"):
         return str(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
+    # 1. in-process Drive API via daily_finetune.Drive (identical to how the
+    #    training runs pull/push the adapter — the reliable path when the folder
+    #    is owner-only and gdown therefore cannot read it).
+    try:
+        sys.path.insert(0, "/content")
+        from daily_finetune import Drive  # noqa: E402
+        drive = Drive(gdrive_py, adc)
+        items = drive.list_files(folder_id)
+        got = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            nm = it.get("n")
+            if nm in ("adapter_model.safetensors", "adapter_config.json") and it.get("id"):
+                r = drive.download(it["id"], str(dest / nm))
+                if os.path.exists(dest / nm) and (dest / nm).stat().st_size > 0:
+                    got += 1
+                else:
+                    print(f"[eval] Drive download of {nm} failed: {str(r)[:160]}", flush=True)
+        if (dest / "adapter_model.safetensors").exists():
+            print(f"[eval] adapter fetched via Drive API ({got} files)", flush=True)
+            return str(dest)
+        print(f"[eval] Drive API listed {len(items)} item(s) but no adapter files — "
+              f"check --adapter-parent is the adapter_in FOLDER id", flush=True)
+    except Exception as e:
+        print(f"[eval] in-process Drive fetch failed: {str(e)[:200]}", flush=True)
+
+    # 2. vendored gdrive.py CLI with the ADC
     if adc and os.path.exists(adc) and os.path.exists(gdrive_py):
         env = {**os.environ, "GDRIVE_ADC": adc}
         r = subprocess.run([sys.executable, gdrive_py, "list", "--folder", folder_id, "--max", "50"],
@@ -59,6 +87,8 @@ def fetch_adapter(folder_id, dest, adc=None, gdrive_py="/content/gdrive.py"):
             items = json.loads(r.stdout or "{}").get("items", [])
         except Exception:
             items = []
+            print(f"[eval] gdrive.py list unparsable: rc={r.returncode} {str(r.stdout)[:160]} {str(r.stderr)[:160]}",
+                  flush=True)
         wanted = {"adapter_model.safetensors": "adapter_model.safetensors",
                   "adapter_config.json": "adapter_config.json"}
         got = 0
@@ -74,9 +104,11 @@ def fetch_adapter(folder_id, dest, adc=None, gdrive_py="/content/gdrive.py"):
             return str(dest)
         print("[eval] gdrive.py fetch incomplete — falling back to gdown", flush=True)
 
+    # 3. gdown (only works for an anyone-with-link folder)
     r = run(f"{sys.executable} -m gdown --folder {folder_id} -O {dest}")
     if not (dest / "adapter_model.safetensors").exists():
-        print(f"[eval] adapter download failed (rc={r.returncode})", flush=True)
+        print(f"[eval] adapter download failed (rc={r.returncode}) — all three fetch paths exhausted",
+              flush=True)
         return None
     return str(dest)
 

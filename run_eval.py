@@ -29,6 +29,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -183,7 +184,13 @@ sys.exit(r.returncode)
         else:
             log_txt = (out if isinstance(out, str) else (out or b"").decode("utf-8", "replace")) or log_txt
             if "[EVALRESULT]" in log_txt:
-                done_report = {"from": "log"}
+                # the VM prints this on success AND on failure — distinguish them,
+                # otherwise a failed eval surfaces as "artifact missing" (which is
+                # exactly how the first run was misreported).
+                m = re.search(r"\[EVALRESULT\]\s*ok=(true|false)(.*)", log_txt)
+                done_report = {"from": "log",
+                               "ok": bool(m and m.group(1) == "true"),
+                               "detail": (m.group(2).strip()[:400] if m else log_txt[-300:])}
                 break
         fid = drive_folder_by_name(folder_out, folder_name)
         if fid:
@@ -209,10 +216,26 @@ sys.exit(r.returncode)
 
     out_dir = rd.REPO / "out"
     out_dir.mkdir(exist_ok=True)
-    if done_report.get("from") == "drive" and str(done_report.get("ok")).lower() != "true":
-        raise SystemExit(f"eval reported failure: {done_report.get('err')!r}")
+
+    # Always resolve the Drive marker: it carries the structured reason (err +
+    # partial/compared counts) that the log line only summarises.
     fid = drive_folder_by_name(folder_out, folder_name)
     files = drive_files(fid) if fid else {}
+    if "eval_done.json" in files:
+        rc, out, err = rd.gdrive("download", files["eval_done.json"],
+                                 "--out", "/tmp/eval_done.json", timeout=180)
+        if rc == 0:
+            try:
+                dr = json.loads(pathlib.Path("/tmp/eval_done.json").read_text())
+                dr["from"] = "drive"
+                done_report = dr
+            except Exception:
+                pass
+    if done_report and str(done_report.get("ok")).lower() != "true":
+        raise SystemExit(f"eval failed on the VM: "
+                         f"{done_report.get('err') or done_report.get('detail')}")
+    if not done_report:
+        raise SystemExit("eval did not report completion (neither [EVALRESULT] nor eval_done.json)")
     if "ab_results.jsonl" not in files:
         raise SystemExit(f"eval finished but ab_results.jsonl is missing from Drive ({folder_name})")
     rc, out, err = rd.gdrive("download", files["ab_results.jsonl"],

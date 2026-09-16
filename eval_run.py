@@ -45,6 +45,37 @@ def run(cmd, timeout=None):
     return r.returncode
 
 
+def run_tee(cmd, log_path, timeout=None):
+    """Run a child, echoing its output live AND capturing it to log_path.
+
+    The captured file is pushed to Drive with the result marker: a failure that
+    only exists in the VM log is undiagnosable once the session is recycled
+    (learned the hard way — the first eval failed with 'rc=1' and no reason).
+    """
+    print(f"$ {' '.join(str(c) for c in cmd)}", flush=True)
+    with open(log_path, "w") as lf:
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception as e:
+            lf.write(f"spawn failed: {e}\n")
+            return 1
+        if p.stdout is None:
+            lf.write("no stdout pipe\n")
+            return 1
+        try:
+            for line in p.stdout:
+                print(line, end="", flush=True)
+                lf.write(line)
+                lf.flush()
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            lf.write(f"\nTIMEOUT after {timeout}s\n")
+            print(f"[eval_run] TIMEOUT after {timeout}s", flush=True)
+            return 1
+    return p.returncode
+
+
 def _count_lines(path):
     try:
         with open(path) as fh:
@@ -122,21 +153,29 @@ def main():
             args, rows_built, 0, False, False,
             f"eval_build produced {rows_built} rows (rc={rc}) — nothing held-out to evaluate"))
 
-    # 4. A/B generation (wall-bounded)
+    # 4. A/B generation (wall-bounded). Output is tee'd to a file that ships with
+    #    the marker, so a failure is diagnosable after the VM is gone.
     if args.deadline_epoch:
         left = (args.deadline_epoch - time.time()) / 60
         print(f"[eval_run] session wall: {left:.1f} min left for the {rows_built}-row comparison",
               flush=True)
-    rc = run([PY, "/content/eval_ab.py", "--rows", rows_path, "--out", results_path,
-              "--adapter-parent", args.adapter_folder, "--adc", args.adc_file,
-              "--max-new-tokens", str(args.max_new_tokens),
-              "--deadline-epoch", str(args.deadline_epoch),
-              "--skip-install"], timeout=10800)
+    ab_log = os.path.join(args.out_dir, "eval_ab.log")
+    rc = run_tee([PY, "/content/eval_ab.py", "--rows", rows_path, "--out", results_path,
+                  "--adapter-parent", args.adapter_folder, "--adc", args.adc_file,
+                  "--max-new-tokens", str(args.max_new_tokens),
+                  "--deadline-epoch", str(args.deadline_epoch),
+                  "--skip-install"], ab_log, timeout=10800)
     compared = _count_lines(results_path)
     if compared == 0:
+        tail = ""
+        try:
+            tail = pathlib.Path(ab_log).read_text()[-600:]
+        except Exception:
+            pass
         return _finish(drive, args, folder_name, build_launch_report(
             args, rows_built, 0, False, False,
-            f"eval_ab produced 0 comparisons (rc={rc}) — adapter missing or wall hit before row 1"))
+            f"eval_ab produced 0 comparisons (rc={rc}); log tail: {tail.strip()[-500:]}"),
+            extra_files=[ab_log])
     partial = compared < rows_built
 
     # 5. publish to Drive (runner watches this folder for eval_done.json)
@@ -144,7 +183,10 @@ def main():
     if not folder:
         print("[eval_run] could not create the Drive result folder", flush=True)
         return 1
-    for local, name in ((results_path, "ab_results.jsonl"), (rows_path, "eval_rows.jsonl")):
+    for local, name in ((results_path, "ab_results.jsonl"), (rows_path, "eval_rows.jsonl"),
+                        (os.path.join(args.out_dir, "eval_ab.log"), "eval_ab.log")):
+        if not os.path.exists(local):
+            continue
         r = drive.upload(local, folder, name)
         if not drive.is_ok(r):
             print(f"[eval_run] upload {name} failed: {str(r)[:200]}", flush=True)
@@ -157,13 +199,20 @@ def main():
     return 0
 
 
-def _finish(drive, args, folder_name, report):
+def _finish(drive, args, folder_name, report, extra_files=None):
     """Push a FAILURE marker so the runner stops waiting instead of hitting its
     deadline (the log channel dies ~60 min into a session, so stdout alone is
-    not a reliable channel)."""
+    not a reliable channel). Anything in extra_files ships alongside it — a
+    failure with no captured log is undiagnosable after the VM is recycled."""
     try:
         folder = drive.ensure_folder(args.results_folder, folder_name)
         if folder:
+            for p in (extra_files or []):
+                try:
+                    if os.path.exists(p):
+                        drive.upload(p, folder, os.path.basename(p))
+                except Exception as e:
+                    print(f"[eval_run] could not upload {p}: {str(e)[:160]}", flush=True)
             tmp = os.path.join(args.out_dir, "eval_done.json")
             pathlib.Path(tmp).write_text(json.dumps(report, indent=2))
             drive.upload_replace(tmp, folder, "eval_done.json")
