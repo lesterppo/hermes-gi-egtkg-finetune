@@ -104,6 +104,10 @@ def test_failure_reporting_is_diagnosable():
           "from daily_finetune import Drive" in ab and "adapter fetched via Drive API" in ab)
     check("adapter fetch reports every exhausted path", "all three fetch paths exhausted" in ab)
     check("logs redact the Drive account display name", "_ACCT_NAME_RE" in daily)
+    check("runner ignores an eval_done.json from an earlier run (date-named folder)",
+          "def read_marker(" in runner and 'dr["run_id"] != run_id' in runner)
+    check("runner falls back to marker mtime when run_id is absent",
+          "not_before_epoch" in runner and "before this run" in runner)
 
 
 def test_eval_ab_wall_behaviour():

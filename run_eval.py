@@ -55,11 +55,52 @@ def drive_folder_by_name(parent, name):
 
 
 def drive_files(folder):
+    """name -> {id, modified} for a Drive folder."""
     rc, out, err = rd.gdrive("list", "--folder", folder, "--max", "50", timeout=180)
     try:
-        return {it.get("n"): it.get("id") for it in json.loads(out).get("items", [])}
+        return {it.get("n"): {"id": it.get("id"), "t": it.get("t")}
+                for it in json.loads(out).get("items", [])}
     except Exception:
         return {}
+
+
+def read_marker(folder, run_id, not_before_epoch=None):
+    """Fetch eval_done.json ONLY if it belongs to THIS run.
+
+    The eval folder is date-named (results/ab-eval-<date>/), so a second attempt
+    on the same day finds the previous attempt's marker. Accepting it made the
+    runner abort in 6 minutes with the OLD error (observed 2026-09-16): a marker
+    is valid only when its run_id matches, or — if it carries no run_id — when it
+    was written after this run started.
+    """
+    files = drive_files(folder) if folder else {}
+    if "eval_done.json" not in files:
+        return None, files
+    rc, out, err = rd.gdrive("download", files["eval_done.json"]["id"],
+                             "--out", "/tmp/eval_done.json", timeout=180)
+    if rc != 0:
+        return None, files
+    try:
+        dr = json.loads(pathlib.Path("/tmp/eval_done.json").read_text())
+    except Exception:
+        return None, files
+    if dr.get("run_id"):
+        if dr["run_id"] != run_id:
+            rd.log(f"ignoring stale eval_done.json (run_id {dr.get('run_id')} != {run_id})")
+            return None, files
+    elif not_before_epoch:
+        ts = files["eval_done.json"].get("t") or ""
+        try:
+            import datetime as _dt
+            mt = _dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+            if mt < not_before_epoch - 60:
+                rd.log(f"ignoring stale eval_done.json (written {ts}, before this run)")
+                return None, files
+        except Exception:
+            pass
+    dr["from"] = "drive"
+    return dr, files
 
 
 def main():
@@ -73,6 +114,7 @@ def main():
     days = os.environ.get("EVAL_DAYS", "60")
     max_new = os.environ.get("EVAL_MAX_NEW_TOKENS", "192")
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    run_started = time.time()
     date = run_id[:8]
     folder_name = f"ab-eval-{date[:4]}-{date[4:6]}-{date[6:8]}"
 
@@ -194,18 +236,10 @@ sys.exit(r.returncode)
                 break
         fid = drive_folder_by_name(folder_out, folder_name)
         if fid:
-            files = drive_files(fid)
-            if "eval_done.json" in files:
-                rc, out, err = rd.gdrive("download", files["eval_done.json"],
-                                         "--out", "/tmp/eval_done.json", timeout=180)
-                if rc == 0:
-                    try:
-                        done_report = json.loads(pathlib.Path("/tmp/eval_done.json").read_text())
-                        done_report["from"] = "drive"
-                    except Exception:
-                        pass
-                if done_report:
-                    break
+            dr, _files = read_marker(fid, run_id, not_before_epoch=run_started)
+            if dr:
+                done_report = dr
+                break
         time.sleep(POLL_S)
 
     rd._stop_keep_alive(keep_alive_stop)
@@ -220,17 +254,9 @@ sys.exit(r.returncode)
     # Always resolve the Drive marker: it carries the structured reason (err +
     # partial/compared counts) that the log line only summarises.
     fid = drive_folder_by_name(folder_out, folder_name)
-    files = drive_files(fid) if fid else {}
-    if "eval_done.json" in files:
-        rc, out, err = rd.gdrive("download", files["eval_done.json"],
-                                 "--out", "/tmp/eval_done.json", timeout=180)
-        if rc == 0:
-            try:
-                dr = json.loads(pathlib.Path("/tmp/eval_done.json").read_text())
-                dr["from"] = "drive"
-                done_report = dr
-            except Exception:
-                pass
+    dr, files = read_marker(fid, run_id, not_before_epoch=run_started)
+    if dr:
+        done_report = dr
     if done_report and str(done_report.get("ok")).lower() != "true":
         raise SystemExit(f"eval failed on the VM: "
                          f"{done_report.get('err') or done_report.get('detail')}")
@@ -238,13 +264,13 @@ sys.exit(r.returncode)
         raise SystemExit("eval did not report completion (neither [EVALRESULT] nor eval_done.json)")
     if "ab_results.jsonl" not in files:
         raise SystemExit(f"eval finished but ab_results.jsonl is missing from Drive ({folder_name})")
-    rc, out, err = rd.gdrive("download", files["ab_results.jsonl"],
+    rc, out, err = rd.gdrive("download", files["ab_results.jsonl"]["id"],
                              "--out", str(out_dir / "ab_results.jsonl"), timeout=300)
     if rc != 0:
         raise SystemExit(f"download ab_results.jsonl failed: {err[-300:]}")
     for name in ("eval_rows.jsonl", "eval_done.json"):
         if name in files:
-            rd.gdrive("download", files[name], "--out", str(out_dir / name), timeout=300)
+            rd.gdrive("download", files[name]["id"], "--out", str(out_dir / name), timeout=300)
 
     # --- mechanical scoring on the runner (no Gemini here) ---
     rc, out, err = rd.sh([sys.executable, str(rd.REPO / "ab_score.py"),
