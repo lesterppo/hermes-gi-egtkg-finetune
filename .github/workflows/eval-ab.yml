@@ -83,7 +83,12 @@ jobs:
         env:
           COLAB_CLIENT_ID: ${{ secrets.COLAB_CLIENT_ID }}
           COLAB_CLIENT_SECRET: ${{ secrets.COLAB_CLIENT_SECRET }}
-          COLAB_REFRESH_TOKEN: ${{ secrets.COLAB_REFRESH_TOKEN }}
+          # EVAL lane runs on its OWN Colab account so it can go in parallel with
+          # the nightly training lane (free tier allows ~1 concurrent GPU session
+          # per account). Set COLAB_REFRESH_TOKEN_EVAL to a second account from
+          # the rotation pool; it falls back to the training account if unset.
+          #   ~/.hermes/scripts/colab_rotate.py set <email> --repos <owner/repo>
+          COLAB_REFRESH_TOKEN: ${{ secrets.COLAB_REFRESH_TOKEN_EVAL || secrets.COLAB_REFRESH_TOKEN }}
           GDRIVE_ADC: ${{ secrets.GDRIVE_ADC }}
           DRIVE_ADAPTER_IN: ${{ secrets.DRIVE_ADAPTER_IN }}
           DRIVE_RESULTS: ${{ secrets.DRIVE_RESULTS }}
