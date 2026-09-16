@@ -91,6 +91,13 @@ def test_failure_reporting_is_diagnosable():
     """A failed eval must surface its REASON, not 'artifact missing'."""
     runner = _read("run_eval.py")
     vm = _read("eval_run.py")
+    j = _read("judge_ab.py")
+    check("judge scores against the model's own context, not the bare span",
+          'r["context"] = q' in j and 'row.get("context") or row.get("evidence")' in j)
+    check("judge refuses to score with no context",
+          "refusing to emit scores" in j)
+    check("ref_span falls back to the evidence field (scored files have no messages)",
+          'row.get("evidence")' in _read("ab_score.py"))
     ab = _read("eval_ab.py")
     daily = _read("run_daily.py")
     check("runner parses ok=false from [EVALRESULT]",
@@ -104,6 +111,13 @@ def test_failure_reporting_is_diagnosable():
           "from daily_finetune import Drive" in ab and "adapter fetched via Drive API" in ab)
     check("adapter fetch reports every exhausted path", "all three fetch paths exhausted" in ab)
     check("logs redact the Drive account display name", "_ACCT_NAME_RE" in daily)
+    j = _read("judge_ab.py")
+    check("judge scores against the model's own context, not the bare span",
+          'r["context"] = q' in j and 'row.get("context") or row.get("evidence")' in j)
+    check("judge refuses to score with no context",
+          "refusing to emit scores" in j)
+    check("ref_span falls back to the evidence field (scored files have no messages)",
+          'row.get("evidence")' in _read("ab_score.py"))
     ab = _read("eval_ab.py")
     check("the VM installs the quantized-load stack itself",
           "bitsandbytes>=0.46.1" in ab)

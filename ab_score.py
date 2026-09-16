@@ -30,7 +30,12 @@ def words(s):
 
 
 def ref_span(row):
-    """The evidence span the trained answer quotes."""
+    """The evidence span the trained answer quotes.
+
+    Falls back to row["evidence"]: the scored/summary files are post-processed
+    and no longer carry `messages`, so a messages-only lookup returns "" — and an
+    empty ground truth silently turns every downstream judgement into noise.
+    """
     a = ""
     for m in row.get("messages", []):
         if m.get("role") == "assistant":
@@ -42,7 +47,7 @@ def ref_span(row):
         m = re.match(pat, a, re.S)
         if m:
             return a[m.end():].strip()
-    return a
+    return a or (row.get("evidence") or "").strip()
 
 
 def contains_provenance(ans, row):

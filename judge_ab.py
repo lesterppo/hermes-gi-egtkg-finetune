@@ -37,7 +37,8 @@ Ignore style and length. Penalise hallucination hard.
 QUESTION:
 {q}
 
-GROUND-TRUTH EVIDENCE:
+GROUND-TRUTH CONTEXT (everything the answering system was given — treat any
+source metadata appearing here as legitimate, NOT as hallucination):
 {ev}
 
 ANSWER A:
@@ -116,6 +117,16 @@ def main():
     rows = [json.loads(l) for l in open(args.results) if l.strip()]
     for r in rows:
         r["evidence"] = ref_span(r)
+        # The judge must see the SAME material the model saw. The user prompt
+        # carries the source line (title/journal/year/PMID) plus the span; the
+        # bare span does not, so judging against the span alone marks a correct
+        # citation copied from the prompt as a fabricated one.
+        q = ""
+        for m in r.get("messages", []):
+            if m.get("role") == "user":
+                q = m.get("content", "")
+                break
+        r["context"] = q
     want = {}
     for part in args.per_kind.split(","):
         k, v = part.split("=")
@@ -130,6 +141,7 @@ def main():
     print(f"[judge] {len(picked)} comparisons -> Gemini Pro (blinded A/B)", flush=True)
 
     results = []
+    skipped = 0
     for i, row in enumerate(picked):
         flip = rng.random() < 0.5
         a = row["base_out"] if flip else row["adapter_out"]
@@ -139,7 +151,15 @@ def main():
             if m.get("role") == "user":
                 q = m.get("content", "")
                 break
-        prompt = PROMPT.format(q=q[:900], ev=(row.get("evidence") or "")[:900],
+        ev = (row.get("context") or row.get("evidence") or "").strip()
+        if not ev:
+            # Scoring "is every claim supported by the evidence" against an EMPTY
+            # evidence block floors both sides and looks like a result. Refuse.
+            skipped += 1
+            print(f"[judge] {i+1}/{len(picked)} {row['id']} SKIPPED — no context",
+                  flush=True)
+            continue
+        prompt = PROMPT.format(q=q[:900], ev=ev[:1800],
                               a=(a or "")[:1200], b=(b or "")[:1200])
         verdict, err = call_gemini(prompt)
         if verdict is None:
@@ -156,6 +176,12 @@ def main():
             for r in results:
                 fh.write(json.dumps(r) + "\n")
         print(f"[judge] {i+1}/{len(picked)} {row['id']} ({row['kind']}) done", flush=True)
+
+    if skipped == len(picked):
+        print("[judge] every row had empty evidence — refusing to emit scores. "
+              "Check ref_span()/the input file before trusting a judge run.",
+              file=sys.stderr)
+        return 2
 
     if results:
         n = len(results)
