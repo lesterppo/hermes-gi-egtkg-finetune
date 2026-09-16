@@ -42,6 +42,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -231,7 +232,21 @@ def _stop_keep_alive(stop_event):
 
 
 def log(msg):
-    print(f"[run_daily] {msg}", flush=True)
+    # Redact identifiers before ANY of this reaches a log: this repo is (or is
+    # about to be) public, and GitHub only masks SECRET values — an account
+    # email printed by `gdrive about` or a Drive id echoed by a helper would be
+    # world-readable in the workflow log.
+    print(f"[run_daily] {_redact(msg)}", flush=True)
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _redact(msg):
+    try:
+        return _EMAIL_RE.sub("<redacted-email>", str(msg))
+    except Exception:
+        return str(msg)
 
 
 def sh(args, timeout=180, check=False, ok_codes=(0,)):
