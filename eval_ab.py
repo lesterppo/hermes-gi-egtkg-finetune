@@ -33,10 +33,30 @@ def run(cmd, **kw):
 
 
 def deps():
+    """Install the eval stack, then PROVE the imports work.
+
+    The version floors matter: transformers' 4-bit quantizer rejects
+    bitsandbytes below its own BITSANDBYTES_MIN_VERSION (0.46.1 with the
+    transformers release Colab currently ships), and that failure surfaces as a
+    long ImportError traceback only at model-load time — i.e. after the adapter
+    download and minutes into the session. Verify here instead.
+    """
     run(f"{sys.executable} -m pip uninstall -q -y torchao")
     run(f"{sys.executable} -m pip install -q "
-        f"'transformers>=4.46,<5.0' 'peft>=0.7' 'bitsandbytes>=0.41' "
+        f"'transformers>=4.46,<5.0' 'peft>=0.7' 'bitsandbytes>=0.46.1' "
         f"'accelerate>=0.25' 'safetensors' gdown")
+    verify_deps()
+
+
+def verify_deps() -> None:
+    """Fail fast, with versions, if the quantized-load stack is incomplete."""
+    import importlib
+    for mod in ("torch", "transformers", "peft", "bitsandbytes", "accelerate"):
+        m = importlib.import_module(mod)
+        print(f"[eval] {mod} {getattr(m, '__version__', '?')}", flush=True)
+    import torch
+    if not torch.cuda.is_available():
+        print("[eval] WARNING: no CUDA device visible", flush=True)
 
 
 def fetch_adapter(folder_id, dest, adc=None, gdrive_py="/content/gdrive.py"):
@@ -159,7 +179,9 @@ def main():
                          "generating and finalize the partial result set (0 = no wall)")
     args = ap.parse_args()
 
-    if not args.skip_install:
+    if args.skip_install:
+        verify_deps()
+    else:
         deps()
     adapter_path = fetch_adapter(args.adapter_parent, "/content/adapter_eval",
                                  adc=args.adc)

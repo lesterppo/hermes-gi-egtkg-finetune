@@ -164,7 +164,7 @@ def main():
                   "--adapter-parent", args.adapter_folder, "--adc", args.adc_file,
                   "--max-new-tokens", str(args.max_new_tokens),
                   "--deadline-epoch", str(args.deadline_epoch),
-                  "--skip-install"], ab_log, timeout=10800)
+                  ], ab_log, timeout=10800)
     compared = _count_lines(results_path)
     if compared == 0:
         tail = ""

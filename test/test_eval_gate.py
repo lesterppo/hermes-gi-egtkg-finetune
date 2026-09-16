@@ -104,6 +104,15 @@ def test_failure_reporting_is_diagnosable():
           "from daily_finetune import Drive" in ab and "adapter fetched via Drive API" in ab)
     check("adapter fetch reports every exhausted path", "all three fetch paths exhausted" in ab)
     check("logs redact the Drive account display name", "_ACCT_NAME_RE" in daily)
+    ab = _read("eval_ab.py")
+    check("the VM installs the quantized-load stack itself",
+          "bitsandbytes>=0.46.1" in ab)
+    check("deps are verified before the model loads",
+          "verify_deps()" in ab and "def verify_deps" in ab)
+    check("verify runs even with --skip-install",
+          "if args.skip_install:\n        verify_deps()" in ab)
+    check("the orchestrator no longer suppresses eval_ab's install",
+          '"--skip-install"], ab_log' not in _read("eval_run.py"))
     check("runner ignores an eval_done.json from an earlier run (date-named folder)",
           "def read_marker(" in runner and 'dr["run_id"] != run_id' in runner)
     check("runner falls back to marker mtime when run_id is absent",
