@@ -96,7 +96,7 @@ def test_failure_reporting_is_diagnosable():
     check("runner parses ok=false from [EVALRESULT]",
           'r"\\[EVALRESULT\\]\\s*ok=(true|false)' in runner)
     check("runner always resolves the Drive marker for the structured reason",
-          'if "eval_done.json" in files:' in runner and "eval failed on the VM" in runner)
+          "read_marker(" in runner and "eval failed on the VM" in runner)
     check("VM tees the child output to a file", "def run_tee(" in vm and '"eval_ab.log"' in vm)
     check("VM ships that log with the marker", "extra_files=[ab_log]" in vm)
     check("VM ships that log on success too", '(os.path.join(args.out_dir, "eval_ab.log"), "eval_ab.log")' in vm)
